@@ -287,8 +287,22 @@ impl Context {
     }
 
     /// Binds this context to the calling thread if not already current.
+    ///
+    /// First takes the error recorded by [`record_err`](Self::record_err), if
+    /// any, and returns it without binding (see [`check_err`](Self::check_err)).
     pub fn bind_to_thread(&self) -> Result<(), DriverError> {
         self.check_err()?;
+        self.make_current()
+    }
+
+    /// Makes this context current on the calling thread if it is not already,
+    /// without reading or clearing the error recorded by
+    /// [`record_err`](Self::record_err).
+    ///
+    /// For cleanup and retirement paths that must neither fail on, nor
+    /// consume, an unrelated error that is pending for the caller's next
+    /// [`check_err`](Self::check_err) or [`bind_to_thread`](Self::bind_to_thread).
+    pub fn make_current(&self) -> Result<(), DriverError> {
         if match ctx::get_current()? {
             Some(curr_ctx) => curr_ctx != self.cu_ctx,
             None => true,
@@ -658,7 +672,18 @@ impl Event {
     /// (or the event was never recorded), `Ok(false)` while it is still in
     /// flight. Any other driver result is returned as the error.
     pub fn query(&self) -> Result<bool, DriverError> {
-        self.context.bind_to_thread()?;
+        self.context.check_err()?;
+        self.query_preserving_err()
+    }
+
+    /// [`query`](Self::query) without reading or clearing the error recorded
+    /// by [`Context::record_err`].
+    ///
+    /// For completion tracking: an unrelated error pending for the caller is
+    /// not a failure of this event, and must neither leak what waits on it
+    /// nor be consumed here.
+    pub(crate) fn query_preserving_err(&self) -> Result<bool, DriverError> {
+        self.context.make_current()?;
         // SAFETY: the handle is valid and its context is current.
         match unsafe { crate::cudarc_shim::event::query(self.cu_event) } {
             Ok(()) => Ok(true),
@@ -688,7 +713,9 @@ impl Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        self.context.record_err(self.context.bind_to_thread());
+        // `make_current` leaves an error already pending in the slot in place,
+        // instead of taking it and storing it back.
+        self.context.record_err(self.context.make_current());
         // Safety: owned handle; the driver defers destruction while in use.
         let _ = unsafe { crate::cudarc_shim::event::destroy(self.cu_event) };
     }

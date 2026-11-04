@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when the tensor is read back, and is now a compile error. Numeric element
   types, including `f16`, `bf16`, and the FP8 and packed FP4 storage types,
   are unaffected (NVIDIA/cuda-rust#1506).
+- Completion-bound retirement in `cuda_core` no longer leaks access leases,
+  allocations, or retained owners when an unrelated error, such as one a
+  destructor on another thread recorded, is pending in the context's error
+  slot. Retirement leaves that error pending for the next checked call
+  instead of consuming it.
 - Generated kernel entry setup and assumptions now use the user function's
   signature as their source location, preserving the inlined body's own
   statement locations and helper scopes.
