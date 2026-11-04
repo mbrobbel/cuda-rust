@@ -363,6 +363,18 @@ pub(super) fn generate_cuda_module_prepare_launch_methods(
     })
 }
 
+/// Doc lines shared by every synchronous launcher about buffer access leases.
+///
+/// Sync launchers take part in the same cross-stream access tracking as
+/// tracked copies and async launches. The implicit GPU-side wait and the
+/// remaining `CUDA_ERROR_NOT_READY` case must be visible in the generated
+/// method's documentation.
+fn sync_launch_lease_docs() -> TokenStream2 {
+    quote! {
+        #[doc = "Every buffer argument takes an access lease on `stream` that lasts until the kernel completes. If an access to one of these buffers is still pending on another stream and conflicts with this launch (either side writes), `stream` waits for it on the GPU once that access has recorded its completion: enqueued `DeviceBuffer` copies and synchronous launches always have, and a `cuda-async` submission has once it outlives its inline spin. A conflicting access without a recorded completion, such as a submission another thread is still enqueuing, rejects the launch with `CUDA_ERROR_NOT_READY` before the kernel is enqueued. While `stream` captures a CUDA graph no lease outlives the call; ordering the graph's replays is up to whoever launches it."]
+    }
+}
+
 pub(super) fn generate_cuda_module_launch_method(kernel: &CudaModuleKernel) -> TokenStream2 {
     if kernel.launch_contract.is_some() {
         generate_cuda_module_prepared_launch_method(kernel)
@@ -376,6 +388,7 @@ fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> Token
     let cfg_attrs = &kernel.cfg_attrs;
     let method_attrs = &kernel.method_attrs;
     let grid_safety_docs = grid_constant_launch_safety_docs(kernel, false);
+    let sync_lease_docs = sync_launch_lease_docs();
     let fn_name = &kernel.fn_name;
     let generics = cuda_module_launch_generics(kernel);
     let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
@@ -394,11 +407,14 @@ fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> Token
     let stream = internal_ident("__cuda_oxide_stream");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
+    let leases = internal_ident("__cuda_oxide_leases");
 
     quote! {
         #(#cfg_attrs)*
         #(#method_attrs)*
         #[doc = "Launches this kernel with an unverified raw launch configuration."]
+        #[doc = ""]
+        #sync_lease_docs
         #[doc = ""]
         #[doc = "# Safety"]
         #[doc = "The launch dimensions and resources must satisfy every indexing, memory-access, launch-bounds, and dynamic-shared-memory assumption made by the kernel. Dimensions not represented by the kernel's index model must not introduce overlapping or out-of-bounds accesses. The caller must also uphold any safety requirements documented on the kernel itself."]
@@ -413,9 +429,10 @@ fn generate_cuda_module_legacy_launch_method(kernel: &CudaModuleKernel) -> Token
         #where_clause
         {
             #function_binding
+            let mut #leases = ::cuda_host::SyncLaunchLeases::new();
             let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
             #(#arg_marshalling)*
-            #launch_call
+            #leases.finish(#stream, #launch_call)
         }
     }
 }
@@ -460,10 +477,13 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
     let function = internal_ident("__cuda_oxide_function");
     let config = internal_ident("__cuda_oxide_config");
     let args = internal_ident("__cuda_oxide_args");
+    let leases = internal_ident("__cuda_oxide_leases");
+    let sync_lease_docs = sync_launch_lease_docs();
 
     quote! {
         #(#cfg_attrs)*
         #(#method_attrs)*
+        #sync_lease_docs
         #grid_safety_docs
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis #unsafety fn #fn_name #impl_generics (
@@ -478,13 +498,18 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
             #requires_checks
             let #function = #prepared.function();
             let #config = #prepared.__raw_config();
+            let mut #leases = ::cuda_host::SyncLaunchLeases::new();
             let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
             #(#prepared_arg_marshalling)*
-            (#launch_call).map_err(::cuda_core::LaunchContractError::from)
+            #leases
+                .finish(#stream, #launch_call)
+                .map_err(::cuda_core::LaunchContractError::from)
         }
 
         #(#cfg_attrs)*
         #[doc = "Unchecked launch escape hatch for this contracted kernel."]
+        #[doc = ""]
+        #sync_lease_docs
         #[doc = ""]
         #[doc = "# Safety"]
         #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract, including any `requires` size requirements. This escape hatch intentionally skips the contract's checks, so an undersized buffer is not caught before the kernel runs."]
@@ -499,9 +524,10 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
         #where_clause
         {
             #unchecked_function_binding
+            let mut #leases = ::cuda_host::SyncLaunchLeases::new();
             let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
             #(#unchecked_arg_marshalling)*
-            #unchecked_launch_call
+            #leases.finish(#stream, #unchecked_launch_call)
         }
     }
 }
@@ -1091,9 +1117,17 @@ fn cuda_module_owned_resources_ty(
     }
 }
 
+/// Marshals one sync launcher parameter into the driver argument list.
+///
+/// Buffer parameters first take an access lease on the launch stream through
+/// `__cuda_oxide_leases`, so the launch is ordered after (or, when that is
+/// impossible, rejected before) conflicting accesses pending on other streams,
+/// and the access stays tracked until the kernel completes.
 fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenStream2 {
     let name = &param.name;
     let args = internal_ident("__cuda_oxide_args");
+    let leases = internal_ident("__cuda_oxide_leases");
+    let stream = internal_ident("__cuda_oxide_stream");
     let value_name = internal_ident(&format!("__cuda_oxide_arg_{index}"));
     match param.marshal {
         CudaModuleParamMarshal::Scalar => {
@@ -1106,6 +1140,7 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
             let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
             let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
+                #leases.acquire_read(#stream, #name)?;
                 let (mut #ptr_name, mut #len_name) =
                     ::cuda_host::read_only_device_buffer_arg(#name);
                 ::cuda_host::push_kernel_device_slice(
@@ -1119,6 +1154,7 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
             let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
             let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             quote! {
+                #leases.acquire_write(#stream, #name)?;
                 let (mut #ptr_name, mut #len_name) =
                     ::cuda_host::writable_device_buffer_arg(#name);
                 ::cuda_host::push_kernel_device_slice(
@@ -1133,6 +1169,7 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
             let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
             let width_name = internal_ident(&format!("__cuda_oxide_arg_{index}_row_width"));
             quote! {
+                #leases.acquire_row_width(#stream, &#name)?;
                 let (mut #ptr_name, mut #len_name, mut #width_name) =
                     ::cuda_host::row_width_device_buffer_arg(#name);
                 ::cuda_host::push_kernel_row_width_device_slice(

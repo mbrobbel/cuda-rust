@@ -118,6 +118,36 @@ kernel was successfully **enqueued** -- not that it finished. To check for
 runtime errors (e.g., out-of-bounds trap), synchronize the stream or context
 afterward.
 
+Every buffer argument takes an access lease on the launch stream, the same one
+tracked copies and async launches take, and keeps it until the kernel
+completes. Work on one stream stays ordered by CUDA and never conflicts. When a
+buffer is still being written on another stream, or the launch would write a
+buffer another stream is still using, the launch stream waits on the GPU for
+that earlier work, using the completion event the earlier work recorded.
+Enqueued `DeviceBuffer` copies and synchronous launches always record one; a
+`cuda-async` submission records one once it outlives its short inline spin.
+Tracked copies issued after the launch wait for it the same way, so a
+`to_host_vec` on another stream returns the kernel's results rather than stale
+data, blocking until the kernel has run. The host never blocks for the launch
+itself, and fork/join code that already orders its streams keeps working
+unchanged: the extra wait is already satisfied. A conflicting access without a
+recorded completion, such as a copy another thread is still enqueuing or a
+cuTile tensor access, makes the launch return `CUDA_ERROR_NOT_READY` without
+enqueuing it. On a stream that is capturing a CUDA graph the launch takes no
+lasting lease, so whoever launches the graph is responsible for ordering its
+replays.
+
+Leasing costs host time on every launch with buffer arguments: one completion
+event is created and recorded per launch, each buffer takes a lock, and the
+leases are queued for background retirement, as for async launches. A newer
+access on a stream replaces the older ones it implies, so this cost does not
+grow with the number of launches still queued on the GPU. In a release build
+it is roughly 2.5 us per launch while the host runs ahead of the GPU and
+roughly 5 us while completed launches are being retired concurrently, instead
+of roughly 1.2 us without tracking. Code that issues many tiny launches in a
+hot loop and already orders its streams by hand can use the unsafe
+`cuda_launch!` macro, which takes no leases.
+
 ## Safe prepared launches
 
 Declare the kernel's geometry when it is part of correctness:
@@ -786,6 +816,7 @@ in doubt.
 |:---------------------------------------|:-------------------------------------------------------|:---------------------------------------------------------------------|
 | `CUDA_ERROR_INVALID_VALUE`             | Grid or block dimensions are zero or exceed limits     | Check `LaunchConfig` values; max block is 1024 threads               |
 | `CUDA_ERROR_NOT_FOUND`                 | PTX entry point name doesn't match                     | Verify `#[kernel]` name matches the loaded module                    |
+| `CUDA_ERROR_NOT_READY`                 | Buffer in use by work with no recorded completion      | Await or synchronize that work first, or launch on the same stream   |
 | `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`   | Too much shared memory or too many registers per block | Reduce `shared_mem_bytes` or block size; use `#[launch_bounds]`      |
 | `CUDA_ERROR_ILLEGAL_INSTRUCTION`       | Kernel hit a trap (panic, assert failure, OOB)         | Debug with `cargo oxide debug` or `gpu_printf!`                      |
 | `CUDA_ERROR_NO_BINARY_FOR_GPU`         | PTX compiled for wrong architecture                    | Rebuild with `--arch` matching your GPU                              |

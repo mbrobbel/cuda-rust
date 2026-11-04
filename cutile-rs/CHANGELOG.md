@@ -16,9 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Dropping a host future returns without waiting for GPU work. Submissions
   retain allocations and access leases independently through completion,
   including graph replay and partial-error paths.
+- A safe `DeviceBuffer` copy, synchronous `#[cuda_module]` launch, or
+  `cuda-async` buffer argument that conflicts with recorded work on another
+  stream now makes its stream wait for that work on the GPU instead of
+  returning `CUDA_ERROR_NOT_READY`. The tracker cannot see `Stream::join` or
+  event waits, so fork/join code no longer fails while the joined work is
+  still running. Work without a recorded completion, such as a submission
+  still being enqueued or a tensor access, is still rejected. Blocking copies
+  such as `to_host_vec` therefore wait for conflicting work on other streams.
+  A `cuda-async` submission records one completion event once it outlives its
+  inline spin; a forgotten future's accesses stop excluding others when that
+  event fires, while its allocations stay leaked.
 
 ### Fixed
 
+- Synchronous `#[cuda_module]` launchers (contracted, `_unchecked`, and raw)
+  take allocation access leases like async launches and tracked copies. Safe
+  code could previously launch a kernel on one stream that read a buffer
+  another stream was still writing, or read back stale data on another stream
+  while the kernel was still writing it. A sync launch also keeps its buffers'
+  allocations alive until it completes. Each launch with buffer arguments
+  records one completion event; the tracker keeps a bounded number of
+  accesses per buffer, so launch cost does not grow with queue depth.
 - CUDA bindings resolve forward-declared struct definitions correctly with
   libclang 22 instead of emitting an empty placeholder with the wrong layout.
 - Retiring tensor completion leases retain allocation access independently of

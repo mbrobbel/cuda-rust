@@ -12,7 +12,7 @@ use cuda_core::{Context, DeviceBuffer, LaunchConfig};
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     task::{Context as TaskContext, Waker},
     time::Duration,
 };
@@ -30,6 +30,39 @@ struct Gate(mpsc::Sender<()>);
 impl Drop for Gate {
     fn drop(&mut self) {
         let _ = self.0.send(());
+    }
+}
+
+/// Signals its channel when dropped, telling a waiting test that the
+/// retirement worker reached it.
+struct Signal(mpsc::Sender<()>);
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Makes the driver quiet enough for a test to park a stream.
+///
+/// The previous test's buffers are freed on cuda-core's retirement worker,
+/// and a synchronous free waits for the whole device. If it overlaps a parked
+/// host callback it stalls every other driver call, including the event the
+/// submission records once its launch outlives the inline spin, until the
+/// gate times out and the gated work has already run. Keeping the primary
+/// context retained also avoids lazy driver loading in a cold context. The
+/// worker runs every ready item in one pass before taking new ones, so once
+/// a second marker has run, everything queued before the first has run too.
+fn quiesce() {
+    static WARM: OnceLock<Arc<cuda_core::Stream>> = OnceLock::new();
+    let stream = WARM.get_or_init(|| Context::new(0).unwrap().new_stream().unwrap());
+    stream.synchronize().unwrap();
+    for _ in 0..2 {
+        let (ran_tx, ran_rx) = mpsc::channel();
+        cuda_core::completion::retain_until_complete(Signal(ran_tx), stream).unwrap();
+        ran_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the retirement worker did not drain");
     }
 }
 
@@ -72,6 +105,7 @@ fn pending_launch_keeps_access(forget: bool, atomic: bool) {
     let mut future = launch
         .schedule(&SingleStream::from_stream(stream.clone()))
         .unwrap();
+    quiesce();
     let (tx, rx) = mpsc::channel();
     stream
         .launch_host_function(move || {
@@ -96,9 +130,13 @@ fn pending_launch_keeps_access(forget: bool, atomic: bool) {
     drop(gate);
     stream.synchronize().unwrap();
     if forget {
+        // A forgotten submission leaks its leases, so the allocation stays
+        // alive. Its accesses recorded their completion once the launch
+        // outlived the future's inline spin, and that event has fired, so
+        // the exclusion ends as it does for any completed tracked access.
         assert!(
-            storage.acquire(&other, false, false).is_err(),
-            "a forgotten submission conservatively retains its access leases"
+            storage.acquire(&other, false, false).is_ok(),
+            "a forgotten submission's completed accesses still exclude others"
         );
     } else {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

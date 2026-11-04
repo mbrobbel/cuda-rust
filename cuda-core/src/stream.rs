@@ -67,4 +67,17 @@ impl Stream {
     pub fn wait(&self, event: &Event) -> Result<(), DriverError> {
         self.wait_event(event)
     }
+
+    /// Whether this stream is currently capturing work into a CUDA graph.
+    ///
+    /// Wraps `cuStreamIsCapturing`, which is legal on a capturing stream in
+    /// every capture mode. An invalidated capture still counts as capturing:
+    /// work enqueued on the stream is not executed until the capture ends.
+    pub fn is_capturing(&self) -> Result<bool, DriverError> {
+        self.context.bind_to_thread()?;
+        // SAFETY: the handle is valid for this RAII wrapper's lifetime and
+        // its context is current.
+        let status = unsafe { crate::cudarc_shim::stream::is_capturing(self.cu_stream) }?;
+        Ok(status != cuda_bindings::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
+    }
 }

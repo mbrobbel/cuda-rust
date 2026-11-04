@@ -157,9 +157,13 @@ completion releases submission owners before returning the result.
 
 `mem::forget(future)` deliberately leaks those owners and their device access
 leases. It does not cancel work or release the leases when the GPU finishes.
-Same-stream use remains ordered, and concurrent reads are allowed; conflicting
-access on another stream returns an error. Await or drop a future normally to
-release its leases. Mutable partitions and `memcpy` destinations must also have
+Same-stream use remains ordered, and concurrent reads are allowed. A submission
+whose work outlives the future's short inline spin records one completion event
+for its buffer leases, so a conflicting safe copy or launch on another stream
+waits for that event on the GPU, and the exclusion ends once it has fired, even
+for a forgotten future; its allocations stay leaked. Other conflicting access
+on another stream, such as a tensor access, returns an error. Await or drop a
+future normally to release its leases. Mutable partitions and `memcpy` destinations must also have
 unique user-visible storage; internal submission owners do not count as aliases.
 
 Custom `KernelInputStored` and `KernelOutputStored` implementations

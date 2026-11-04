@@ -103,9 +103,9 @@ pub use kernel_family::{
 pub use launch::{
     CudaKernel, CudaKernelArgument, CudaKernelArgumentKind, CudaKernelScalarKind,
     CudaKernelSignature, GenericCudaKernel, HasLength, KernelScalar, ReadOnly, RowWidth,
-    RowWidthOwned, Scalar, WriteOnly, push_kernel_device_slice, push_kernel_row_width_device_slice,
-    push_kernel_scalar, read_only_device_buffer_arg, row_width_device_buffer_arg,
-    writable_device_buffer_arg,
+    RowWidthOwned, Scalar, SyncLaunchLeases, WriteOnly, push_kernel_device_slice,
+    push_kernel_row_width_device_slice, push_kernel_scalar, read_only_device_buffer_arg,
+    row_width_device_buffer_arg, writable_device_buffer_arg,
 };
 #[doc(hidden)]
 pub use type_id::__intern_generic_kernel_name;

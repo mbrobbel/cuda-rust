@@ -732,6 +732,72 @@ fn uncontracted_sync_launch_is_always_unsafe() {
     assert!(expanded.contains("unverifiedrawlaunchconfiguration"));
 }
 
+/// Every synchronous launcher leases its buffer arguments on the launch stream
+/// before marshalling them and retires those leases behind the launch.
+///
+/// Without the lease a safe contracted launch could run while a tracked copy
+/// or launch on another stream still writes one of its buffers, instead of
+/// waiting for it, and its own writes would stay invisible to tracked accesses
+/// issued after it returns.
+#[test]
+fn sync_launchers_lease_every_buffer_argument() {
+    let module: ItemMod = parse_quote! {
+        mod kernels {
+            #[kernel]
+            #[launch_contract(domain = 1, block = (64, 1, 1))]
+            pub fn map(input: &[u32], mut out: DisjointSlice<u32>) {}
+
+            #[kernel]
+            pub fn raw(input: &[u32], out: &mut [u32]) {}
+
+            #[kernel]
+            pub fn tiles(mut out: DisjointSlice<f32, Runtime2DIndex>) {}
+        }
+    };
+    let expanded = expand_to_compact_string(module);
+
+    // `map` has a safe prepared launcher and an `_unchecked` twin; `raw` and
+    // `tiles` each have one legacy raw launcher.
+    let lease_sets = expanded
+        .matches("letmut__cuda_oxide_leases=::cuda_host::SyncLaunchLeases::new();")
+        .count();
+    assert_eq!(lease_sets, 4, "{expanded}");
+    assert_eq!(
+        expanded
+            .matches("__cuda_oxide_leases.finish(__cuda_oxide_stream,")
+            .count(),
+        4,
+        "{expanded}"
+    );
+    assert_eq!(
+        expanded
+            .matches("__cuda_oxide_leases.acquire_read(__cuda_oxide_stream,input)?;")
+            .count(),
+        3,
+        "{expanded}"
+    );
+    assert_eq!(
+        expanded
+            .matches("__cuda_oxide_leases.acquire_write(__cuda_oxide_stream,out)?;")
+            .count(),
+        3,
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("__cuda_oxide_leases.acquire_row_width(__cuda_oxide_stream,&out)?;"),
+        "{expanded}"
+    );
+    // The lease is taken before the packet, so a rejected launch builds none.
+    let lease = expanded
+        .find("acquire_read(__cuda_oxide_stream,input)?;")
+        .unwrap();
+    let packet = expanded.find("read_only_device_buffer_arg(input)").unwrap();
+    assert!(lease < packet, "{expanded}");
+    // The docs explain both outcomes of a cross-stream conflict.
+    assert!(expanded.contains("waitsforitontheGPU"), "{expanded}");
+    assert!(expanded.contains("CUDA_ERROR_NOT_READY"), "{expanded}");
+}
+
 #[test]
 fn unsafe_source_kernel_keeps_prepared_launch_unsafe() {
     let module: ItemMod = parse_quote! {

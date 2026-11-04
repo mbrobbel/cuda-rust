@@ -422,6 +422,142 @@ pub fn row_width_device_buffer_arg<T>(
     )
 }
 
+/// Allocation access leases held by one synchronous `#[cuda_module]` launch.
+///
+/// A synchronous launcher borrows its buffers only for the call, but the
+/// kernel keeps reading and writing them after the call returns. Every buffer
+/// argument therefore takes an access lease on the launch stream before the
+/// launch is enqueued, like tracked copies and async launches do, and the
+/// leases of an enqueued launch stay live until it completes. Later tracked
+/// accesses on other streams cannot overtake the kernel, and its buffers
+/// outlive a `Drop` issued while it is in flight.
+///
+/// A conflicting access on another stream whose completion has been recorded
+/// is ordered rather than rejected: the launch stream waits for it on the GPU.
+/// That keeps already ordered patterns such as fork/join working however the
+/// GPU is timed. Only a conflicting access without a recorded completion
+/// rejects the launch with `CUDA_ERROR_NOT_READY` before it is enqueued.
+///
+/// On a stream that is capturing a CUDA graph the kernel does not run during
+/// the call, so the leases are recording accesses that neither conflict nor
+/// outlive the call; whoever launches the captured graph orders its replays.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SyncLaunchLeases {
+    /// The leases taken so far, in argument order.
+    leases: Vec<cuda_core::AllocationLease>,
+    /// Whether the launch stream is capturing, queried once by the first
+    /// buffer argument; `None` while no buffer has been leased.
+    capturing: Option<bool>,
+}
+
+impl SyncLaunchLeases {
+    /// Starts an empty lease set for one launch.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Leases a buffer the kernel reads through a shared slice.
+    ///
+    /// Element types with interior mutability, such as device atomics, can be
+    /// written through a shared slice, so their reads lease exclusive access.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CUDA_ERROR_NOT_READY` when a conflicting access on another
+    /// stream has not recorded its completion yet, so the launch cannot be
+    /// ordered after it, or `CUDA_ERROR_INVALID_CONTEXT` when the buffer
+    /// belongs to a different context than `stream`. Driver errors from
+    /// querying the capture status or enqueuing a stream wait are passed on.
+    #[inline]
+    pub fn acquire_read<T>(
+        &mut self,
+        stream: &cuda_core::CudaStream,
+        buffer: &cuda_core::DeviceBuffer<T>,
+    ) -> Result<(), cuda_core::DriverError> {
+        self.acquire(stream, buffer, buffer.shared_access_writes())
+    }
+
+    /// Leases a buffer the kernel may write through a writable slice.
+    ///
+    /// # Errors
+    ///
+    /// As for [`acquire_read`](Self::acquire_read).
+    #[inline]
+    pub fn acquire_write<T>(
+        &mut self,
+        stream: &cuda_core::CudaStream,
+        buffer: &mut cuda_core::DeviceBuffer<T>,
+    ) -> Result<(), cuda_core::DriverError> {
+        self.acquire(stream, buffer, true)
+    }
+
+    /// Leases the buffer behind a row-width slice, which the kernel writes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`acquire_read`](Self::acquire_read).
+    #[inline]
+    pub fn acquire_row_width<T>(
+        &mut self,
+        stream: &cuda_core::CudaStream,
+        bound: &RowWidth<'_, T>,
+    ) -> Result<(), cuda_core::DriverError> {
+        self.acquire(stream, bound.buffer, true)
+    }
+
+    /// Registers one buffer access on `stream` and keeps its lease.
+    ///
+    /// Empty buffers have no device storage to protect, so they take no
+    /// lease, matching the tracked copy paths. Outside graph capture the
+    /// access is ordered after conflicting recorded accesses on other streams
+    /// through [`cuda_core::RawDeviceBuffer::acquire_ordered`].
+    fn acquire<T>(
+        &mut self,
+        stream: &cuda_core::CudaStream,
+        buffer: &cuda_core::DeviceBuffer<T>,
+        write: bool,
+    ) -> Result<(), cuda_core::DriverError> {
+        if buffer.num_bytes() == 0 {
+            return Ok(());
+        }
+        let capturing = match self.capturing {
+            Some(capturing) => capturing,
+            None => *self.capturing.insert(stream.is_capturing()?),
+        };
+        let lease = if capturing {
+            buffer.storage().acquire(stream, write, true)?
+        } else {
+            buffer.storage().acquire_ordered(stream, write)?
+        };
+        self.leases.push(lease);
+        Ok(())
+    }
+
+    /// Hands the leases to completion-bound retirement after the launch call.
+    ///
+    /// The leases are retained even when `launched` is an error, because the
+    /// driver may still have accepted part of the work. Returns the launch
+    /// error first, then any failure to record the completion event; in the
+    /// latter case the leases are leaked, so their exclusion never ends early.
+    /// During graph capture nothing ran, so the recording leases are released
+    /// here instead of recording an event that would never complete.
+    #[inline]
+    pub fn finish(
+        self,
+        stream: &cuda_core::CudaStream,
+        launched: Result<(), cuda_core::DriverError>,
+    ) -> Result<(), cuda_core::DriverError> {
+        if self.capturing == Some(true) {
+            drop(self.leases);
+            return launched;
+        }
+        let retained = cuda_core::AllocationLease::retain_all_until_complete(self.leases, stream);
+        launched.and(retained)
+    }
+}
+
 /// Pushes a row-width device slice argument triple into a driver argument
 /// list.
 ///

@@ -47,12 +47,15 @@ impl Drop for AccessLease {
 #[derive(Default)]
 struct OwnerSet {
     leases: Vec<AccessLease>,
+    /// Buffer access leases, kept typed so the submission can attach its
+    /// completion event to them once all of its work is enqueued.
+    allocation_leases: Vec<cuda_core::AllocationLease>,
     others: Vec<Box<dyn Send>>,
 }
 
 impl OwnerSet {
     fn is_empty(&self) -> bool {
-        self.leases.is_empty() && self.others.is_empty()
+        self.leases.is_empty() && self.allocation_leases.is_empty() && self.others.is_empty()
     }
 }
 
@@ -73,6 +76,15 @@ impl Owners {
 
     fn retain_lease(&mut self, lease: AccessLease) -> Result<(), DeviceError> {
         self.set()?.leases.push(lease);
+        Ok(())
+    }
+
+    /// Keeps a buffer access lease until the submission completes.
+    fn retain_allocation_lease(
+        &mut self,
+        lease: cuda_core::AllocationLease,
+    ) -> Result<(), DeviceError> {
+        self.set()?.allocation_leases.push(lease);
         Ok(())
     }
 
@@ -114,6 +126,48 @@ impl Submission {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain_lease(lease)
+    }
+
+    /// Keeps a buffer access lease, taken for work on this submission's
+    /// stream, until the submission completes.
+    pub(crate) fn retain_allocation_lease(
+        &self,
+        lease: cuda_core::AllocationLease,
+    ) -> Result<(), DeviceError> {
+        self.owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_allocation_lease(lease)
+    }
+
+    /// Records one event on the stream and attaches it to every buffer
+    /// access lease held so far as that access's completion.
+    ///
+    /// A conflicting tracked access on another stream can then be ordered
+    /// after this submission with a stream wait instead of being rejected
+    /// with `CUDA_ERROR_NOT_READY` until the submission is retired. The
+    /// leases themselves stay retained until completion as before. Nothing
+    /// is recorded when no buffer lease is held.
+    ///
+    /// # Safety
+    /// All work of this submission that uses those leases must already be
+    /// enqueued on its stream, and no further work may use the leases.
+    pub(crate) unsafe fn record_lease_completion(&self) -> Result<(), cuda_core::DriverError> {
+        let owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(set) = owners.0.as_ref() else {
+            return Ok(());
+        };
+        // An event recorded into a capture would only complete on replay.
+        if set.allocation_leases.is_empty() || self.stream.is_capturing()? {
+            return Ok(());
+        }
+        let event = Arc::new(self.stream.record_event(None)?);
+        for lease in &set.allocation_leases {
+            // SAFETY: the event was recorded on the stream every lease was
+            // acquired for, after all work using them (caller contract).
+            unsafe { lease.complete_after(&event) };
+        }
+        Ok(())
     }
 
     pub(crate) fn record(&self, resource: Arc<dyn ReplayResource>) {

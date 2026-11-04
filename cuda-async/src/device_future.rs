@@ -381,6 +381,15 @@ impl<T: Send, DO: DeviceOp<Output = T>> Future for DeviceFuture<T, DO> {
                         return Poll::Ready(Err(DeviceError::Driver(e)));
                     }
                 }
+                // The work outlives the spin, so let tracked accesses on other
+                // streams order themselves after it instead of failing with
+                // CUDA_ERROR_NOT_READY until it is retired. Failing to record
+                // only keeps the conservative rejection.
+                if let Some(ctx) = self.execution_context.as_ref() {
+                    // SAFETY: `execute` has enqueued every operation of this
+                    // submission; the future submits nothing further.
+                    let _ = unsafe { ctx.record_lease_completion() };
+                }
                 // Add the callback. We only want to do this once.
                 if let Err(e) = unsafe { self.register_callback(waker_state.clone()) } {
                     self.state = DeviceFutureState::Complete;

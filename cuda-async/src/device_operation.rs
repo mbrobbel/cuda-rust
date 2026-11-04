@@ -111,11 +111,24 @@ struct BufferAccess {
     write: bool,
 }
 impl ReplayResource for BufferAccess {
+    /// Leases the storage for work about to be enqueued on the context's
+    /// stream.
+    ///
+    /// Outside capture, a conflicting access on another stream that has
+    /// recorded its completion (a tracked copy, a synchronous launch, or a
+    /// submission that outlived its inline spin) is ordered with a
+    /// stream wait instead of rejected, so code that already orders its
+    /// streams with `join` or events does not fail depending on GPU timing.
+    /// Capture registers a recording access; each replay reacquires it here.
     fn retain_for_launch(&self, ctx: &ExecutionContext) -> Result<(), DeviceError> {
-        let lease = self
-            .storage
-            .acquire(ctx.get_cuda_stream(), self.write, ctx.is_recording())?;
-        ctx.retain(lease)
+        let stream = ctx.get_cuda_stream();
+        if ctx.is_recording() {
+            let lease = self.storage.acquire(stream, self.write, true)?;
+            ctx.retain(lease)
+        } else {
+            let lease = self.storage.acquire_ordered(stream, self.write)?;
+            ctx.submission.retain_allocation_lease(lease)
+        }
     }
     fn replay_identity(&self) -> (usize, bool) {
         (self.storage.allocation_id(), self.write)
@@ -215,6 +228,21 @@ impl ExecutionContext {
     /// from here on and reacquires them on each replay.
     pub(crate) fn take_recorded(&self) -> Vec<Arc<dyn ReplayResource>> {
         self.submission.take_recorded()
+    }
+
+    /// Attaches a completion event to the buffer access leases of this
+    /// submission, so conflicting tracked accesses on other streams can wait
+    /// for it on the GPU. Does nothing while recording a graph.
+    ///
+    /// # Safety
+    /// Every operation of this submission must already be enqueued, and no
+    /// further work may be submitted through this context.
+    pub(crate) unsafe fn record_lease_completion(&self) -> Result<(), cuda_core::DriverError> {
+        if self.recording {
+            return Ok(());
+        }
+        // SAFETY: forwarded caller contract; the context does not record.
+        unsafe { self.submission.record_lease_completion() }
     }
 
     /// The caller has proved completion, or independently guarantees resource

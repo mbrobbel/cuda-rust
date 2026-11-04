@@ -17,8 +17,15 @@ allocations, borrowed pointers, and foreign owners use this same representation.
 Foreign `DeviceAllocation` implementations supply their actual context.
 
 Safe submissions retain allocation access leases independently of their future.
-Conflicting accesses on different streams return `CUDA_ERROR_NOT_READY` until
-completion; accesses in one stream remain ordered by CUDA. Buffer and stream
+Accesses in one stream remain ordered by CUDA. A safe copy or launch that
+conflicts with pending work on another stream (either side writes) is ordered
+after it: its stream waits on the GPU for the completion event that work
+recorded, so code that already orders its streams with `join` or events never
+fails because the earlier work is still running. Conflicting work that has not
+recorded a completion yet, such as a submission another thread is still
+enqueuing, returns `CUDA_ERROR_NOT_READY` instead. The tracker keeps at most a
+few accesses per stream: an access whose completion implies an earlier one's
+replaces it. Buffer and stream
 destructors retire resources without waiting for GPU work on the dropping
 thread. If completion cannot be established, retirement retains the resource
 instead of freeing or reusing it. Unsafe raw-pointer users must establish their

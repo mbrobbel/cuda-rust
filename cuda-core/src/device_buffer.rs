@@ -185,7 +185,7 @@ impl<T> DeviceBuffer<T> {
         write: bool,
         enqueue: impl FnOnce() -> Result<(), DriverError>,
     ) -> Result<(), DriverError> {
-        let lease = self.storage.acquire(stream, write, false)?;
+        let lease = self.storage.acquire_ordered(stream, write)?;
         self.storage.context().bind_to_thread()?;
         let submitted = enqueue();
         let retained = lease.retain_until_complete(stream);
@@ -734,7 +734,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             }
             return Ok(host);
         }
-        let lease = self.storage.acquire(stream, false, false)?;
+        let lease = self.storage.acquire_ordered(stream, false)?;
         self.storage.context().bind_to_thread()?;
         let submitted = unsafe {
             crate::memory::memcpy_dtoh_async(
@@ -766,7 +766,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if self.num_bytes() == 0 {
             return Ok(());
         }
-        let lease = self.storage.acquire(stream, false, false)?;
+        let lease = self.storage.acquire_ordered(stream, false)?;
         self.storage.context().bind_to_thread()?;
         let submitted = unsafe {
             crate::memory::memcpy_dtoh_async(

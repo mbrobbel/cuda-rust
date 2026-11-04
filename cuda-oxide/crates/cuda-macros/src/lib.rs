@@ -1159,6 +1159,10 @@ pub fn readonly(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - every pointer argument is **device-accessible** (a valid device
 ///   allocation, or host memory reachable via HMM/unified memory) and stays
 ///   alive until the kernel finishes;
+/// - no access on another stream that conflicts with the kernel's reads or
+///   writes is pending or issued before it finishes; unlike `#[cuda_module]`
+///   launch methods, this macro takes no allocation access leases, so tracked
+///   copies and launches cannot detect the kernel's accesses;
 /// - the grid, block, dynamic-shared-memory size, cluster dimensions, and
 ///   cooperative mode satisfy every indexing, resource, and synchronization
 ///   assumption made by the kernel.

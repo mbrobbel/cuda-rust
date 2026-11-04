@@ -271,6 +271,13 @@ Under the hood, `fork` and `join` use CUDA events -- `cuEventRecord` on one
 stream, `cuStreamWaitEvent` on another. The events are GPU-side synchronization
 tokens; no host thread blocks during the fork or the join.
 
+The launches and tracked copies also lease their buffers. A launch or copy that
+touches a buffer still in use by recorded work on another stream makes its own
+stream wait for that work as well, so a forgotten `join` does not race on those
+buffers, and reading `buf_a` back on the main stream after the `join` returns
+the children's results even while they are still running. With the `join` in
+place that extra wait is already satisfied.
+
 ### Events for fine-grained ordering
 
 When `fork`/`join` is too coarse, you can use events directly to establish

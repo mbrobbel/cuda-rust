@@ -74,6 +74,7 @@ mod kernels {
         const __cuda_oxide_function_storage: usize,
         const __cuda_oxide_function_cache: usize,
         const __cuda_oxide_launch: usize,
+        const __cuda_oxide_leases: usize,
         const __CudaModuleArg0: usize,
         const __CudaModuleArg1: usize,
     >(
@@ -98,6 +99,7 @@ mod kernels {
         const __cuda_oxide_args: usize,
         const __cuda_oxide_launch: usize,
         const __cuda_oxide_owned: usize,
+        const __cuda_oxide_leases: usize,
         const __cuda_oxide_type_witness_0: usize,
     >(
         stream: &'__cuda_oxide_async [u32],
@@ -115,6 +117,7 @@ mod kernels {
             __cuda_oxide_args,
             __cuda_oxide_launch,
             __cuda_oxide_owned,
+            __cuda_oxide_leases,
             __cuda_oxide_type_witness_0,
         );
     }
@@ -602,7 +605,7 @@ fn ptx_name_helper_preserves_lifetime_bounds() {
 
 #[test]
 fn generated_names_do_not_capture_user_const_generics() {
-    let name = kernels::hygiene_probe_ptx_name::<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>();
+    let name = kernels::hygiene_probe_ptx_name::<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>();
     assert!(is_lowercase_hex_32(split_tid_name(name, "hygiene_probe")));
 }
 
