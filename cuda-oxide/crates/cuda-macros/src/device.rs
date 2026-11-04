@@ -14,7 +14,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use reserved_oxide_symbols::{DEVICE_EXTERN_PREFIX, DEVICE_PREFIX, constant_symbol};
 use syn::{
-    ForeignItem, Ident, ItemFn, ItemForeignMod, LitStr, Token,
+    Attribute, ForeignItem, Ident, ItemFn, ItemForeignMod, LitStr, Meta, Token,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -114,6 +114,9 @@ pub(crate) fn device_entry(_attr: TokenStream, item: TokenStream) -> TokenStream
 ///
 /// Handles both non-generic and generic device functions:
 /// - **Non-generic**: `#[no_mangle]` on the prefixed function, `#[inline(always)]` wrapper.
+///   A user `#[inline]` stays on the prefixed function, where the backend reads it
+///   as the device inline hint. For `#[inline]` and `#[inline(always)]` that
+///   function also gets `#[allow(unused_attributes)]` (see `exported_inline_allow`).
 /// - **Generic**: No `#[no_mangle]` (generics use mangled symbols), `#[inline(never)]` on
 ///   the prefixed function (so monomorphizations appear in CGUs for the collector),
 ///   `#[inline(always)]` wrapper with generics + turbofish forwarding.
@@ -199,8 +202,10 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
             call
         };
         // Non-generic device function: simple case.
+        let inline_allow = exported_inline_allow(&input);
         let expanded = quote! {
             #[unsafe(no_mangle)]
+            #inline_allow
             #input
 
             /// Wrapper for the device function with the original name.
@@ -211,6 +216,53 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
         };
 
         TokenStream::from(expanded)
+    }
+}
+
+/// Allow the user's `#[inline]` on the exported prefixed function.
+///
+/// A non-generic `#[device]` function is `#[no_mangle]`, and rustc's
+/// `unused_attributes` lint reports `#[inline]` and `#[inline(always)]` as
+/// ignored on externally exported functions. That lint is about the host:
+/// an exported symbol is not offered for cross-crate inlining. rustc still
+/// records the attribute in the function's codegen attributes, and the device
+/// backend turns it into `inlinehint` or `alwaysinline` in LLVM IR, so the
+/// attribute stays and only the lint is allowed.
+///
+/// The allow covers the whole function, so it is emitted only for the forms
+/// the lint fires on (see `inline_attr_requests_inlining`). `#[inline(never)]`
+/// and device functions without an `inline` attribute keep their
+/// `unused_attributes` diagnostics and get no allow, which also keeps them
+/// compiling under `#![forbid(unused_attributes)]`.
+///
+/// An `allow` cannot lift a `forbid`. In a crate with
+/// `#![forbid(unused_attributes)]`, `#[device]` with `#[inline]` or
+/// `#[inline(always)]` is still rejected (E0453 at the attribute instead of
+/// the lint), and under `#![forbid(unused)]` rustc reports the allow through
+/// the `forbidden_lint_groups` future-incompatibility warning. Such crates
+/// have to drop the `inline` attribute or relax the `forbid` to `deny`.
+pub(crate) fn exported_inline_allow(input: &ItemFn) -> Option<proc_macro2::TokenStream> {
+    input
+        .attrs
+        .iter()
+        .any(inline_attr_requests_inlining)
+        .then(|| quote! { #[allow(unused_attributes)] })
+}
+
+/// Whether `attr` is an `inline` attribute that asks for inlining.
+///
+/// Matches bare `#[inline]` and `#[inline(always)]`, the two forms rustc's
+/// "ignored on externally exported functions" lint reports. `#[inline(never)]`
+/// is never reported, and malformed forms are left to rustc's own errors, so
+/// neither gets an allow.
+fn inline_attr_requests_inlining(attr: &Attribute) -> bool {
+    if !attr.path().is_ident("inline") {
+        return false;
+    }
+    match &attr.meta {
+        Meta::Path(_) => true,
+        Meta::List(list) => list.parse_args::<Ident>().is_ok_and(|arg| arg == "always"),
+        Meta::NameValue(_) => false,
     }
 }
 

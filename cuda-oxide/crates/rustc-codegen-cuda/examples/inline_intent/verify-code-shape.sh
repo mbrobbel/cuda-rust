@@ -108,6 +108,8 @@ require_define_keyword "plain #[inline(never)] helper" 'inline_intent__never_add
 require_define_keyword "non-generic #[inline(never)] #[device] helper" 'never_dev' noinline
 require_define_keyword "plain #[inline] helper" 'inline_intent__hint_mul' inlinehint
 require_define_keyword "plain #[inline(always)] helper" 'inline_intent__always_sub' alwaysinline
+require_define_keyword "non-generic #[inline] #[device] helper" 'hint_dev' inlinehint
+require_define_keyword "non-generic #[inline(always)] #[device] helper" 'always_dev' alwaysinline
 forbid_define_keywords "const-generic #[device] helper" '(.*cuda_oxide_device_[0-9a-f]+_)?scale_by[A-Za-z0-9_.$]*'
 
 # PTX: the noinline helpers survive opt as functions the entry calls.
@@ -120,11 +122,15 @@ if [[ "$(entry_body intent | grep -c 'call\.uni')" -lt 2 ]]; then
     exit 1
 fi
 
-# PTX: alwaysinline leaves no function. The const-generic #[device] helper
-# keeps a `.func` because every #[device] function stays exported through
-# `@llvm.used`, but the entry must not call it: its factor 4.0 (0f40800000)
-# is an immediate in the entry instead.
+# PTX: alwaysinline leaves no function. The #[device] helpers keep a `.func`
+# because every #[device] function stays exported through `@llvm.used`, but
+# the entry must not call the alwaysinline one or the const-generic one. The
+# latter's factor 4.0 (0f40800000) is an immediate in the entry instead.
 forbid_ptx_function "alwaysinline helper" 'inline_intent__always_sub'
+if entry_body intent | grep -E 'always_dev' >/dev/null; then
+    echo "error: the intent entry still calls the alwaysinline #[device] helper in ${ptx}" >&2
+    exit 1
+fi
 if entry_body intent | grep -E 'scale_by' >/dev/null; then
     echo "error: the intent entry still calls the const-generic #[device] helper in ${ptx}" >&2
     exit 1

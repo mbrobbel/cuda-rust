@@ -13,6 +13,12 @@
 //! collector on the host side, so it is not carried to device code and
 //! const-generic arguments keep folding into the kernel.
 //!
+//! A non-generic `#[device]` function is exported with `#[no_mangle]`. rustc's
+//! `unused_attributes` lint calls `#[inline]` ignored on such a function, but
+//! that is about host-side cross-crate inlining: the attribute still reaches
+//! the device backend, and `#[device]` allows the lint. This crate denies the
+//! lint so the pattern stays warning-free.
+//!
 //! The kernel computes the same arithmetic as the host reference through one
 //! helper of each kind. `verify-code-shape.sh` checks the attribute on each
 //! definition in the pre-opt LLVM IR and what opt made of it in the PTX: real
@@ -23,6 +29,8 @@
 //! MIR inlining is off for this crate (see Cargo.toml) so that every helper
 //! reaches LLVM as its own definition. Otherwise rustc folds the small ones
 //! into the kernel before any attribute could be observed.
+
+#![deny(unused_attributes)]
 
 use cuda_core::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
@@ -41,9 +49,7 @@ pub fn hint_mul(a: f32, b: f32) -> f32 {
 }
 
 /// `#[inline(always)]` on a plain function: `alwaysinline`, so opt leaves no
-/// function behind. A plain function is used because a non-generic `#[device]`
-/// function is an exported symbol, and rustc ignores `#[inline(always)]` on
-/// exported functions.
+/// function behind.
 #[inline(always)]
 pub fn always_sub(a: f32, b: f32) -> f32 {
     a - b
@@ -59,6 +65,22 @@ mod kernels {
     #[device]
     pub fn never_dev(a: f32, b: f32) -> f32 {
         a * 2.0 + b
+    }
+
+    /// `#[inline(always)]` on a non-generic `#[device]` function: the same
+    /// `alwaysinline` as on a plain function, although the function is an
+    /// exported symbol.
+    #[device]
+    #[inline(always)]
+    pub fn always_dev(a: f32, b: f32) -> f32 {
+        a - b * 0.5
+    }
+
+    /// `#[inline]` on a non-generic `#[device]` function: an `inlinehint`.
+    #[device]
+    #[inline]
+    pub fn hint_dev(a: f32, b: f32) -> f32 {
+        a * b + 0.5
     }
 
     /// A const-generic `#[device]` function. The macro's own `#[inline(never)]`
@@ -87,6 +109,8 @@ pub fn reference(input: &[f32], i: usize) -> f32 {
     v = hint_mul(v, 2.0);
     v = always_sub(v, 1.0);
     v += kernels::never_dev(x, 1.0);
+    v = kernels::always_dev(v, x);
+    v = kernels::hint_dev(v, 0.5);
     v + kernels::scale_by::<4>(x)
 }
 
