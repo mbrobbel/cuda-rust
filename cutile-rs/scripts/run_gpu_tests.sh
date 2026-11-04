@@ -273,7 +273,8 @@ for test_target in \
     execute_once \
     execution_lock \
     pool_allocation \
-    reactor_correctness
+    reactor_correctness \
+    rejected_launch_leases
 do
     run_gpu_step \
         "cuda-async GPU integration test ${test_target}" \

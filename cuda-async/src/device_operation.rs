@@ -97,7 +97,9 @@ pub type DeviceOrdinal = usize;
 pub use crate::submission::{AccessLease, AccessTracked};
 
 /// A graph-owned resource whose device accesses must be acquired on each replay.
-/// Implementations must register the access with the supplied execution context.
+/// Implementations must register the access with the supplied execution context
+/// and must not enqueue GPU work: a replay rejected on a later resource releases
+/// what earlier ones registered immediately.
 #[doc(hidden)]
 pub trait ReplayResource: Send + Sync {
     fn retain_for_launch(&self, ctx: &ExecutionContext) -> Result<(), DeviceError>;
@@ -201,6 +203,51 @@ impl ExecutionContext {
             recording: true,
             ..Self::new(stream)
         }
+    }
+
+    /// Retains resources for one submission all-or-nothing: `acquire` runs
+    /// against a private staging submission on the same stream, which is
+    /// merged into this context's submission only if every acquisition
+    /// succeeded.
+    ///
+    /// On failure the staged leases and owners are released synchronously
+    /// instead of riding out the stream's unrelated queued work: nothing was
+    /// enqueued under the staging submission, so no GPU work can use them.
+    /// This keeps a launch rejected on its k-th argument from leaving phantom
+    /// leases on arguments 0..k that block other streams.
+    ///
+    /// Staging in a separate submission, rather than truncating this one back
+    /// to a checkpoint on failure, never releases owners that a clone of this
+    /// context (which shares the submission) registered in the meantime.
+    ///
+    /// # Safety
+    ///
+    /// `acquire` must only register owners, leases and recorded resources
+    /// with the context it is given. It must not enqueue GPU work, because
+    /// on failure everything it registered is released before returning.
+    #[doc(hidden)]
+    pub unsafe fn retain_all(
+        &self,
+        acquire: impl FnOnce(&ExecutionContext) -> Result<(), DeviceError>,
+    ) -> Result<(), DeviceError> {
+        // Same stream, device, pool and capture mode; only the submission is
+        // private. Built field by field so the shared submission is not cloned.
+        let staged = Self {
+            ordinal: self.ordinal,
+            cuda_stream: self.cuda_stream.clone(),
+            device: self.device.clone(),
+            pool: self.pool.clone(),
+            submission: Arc::new(crate::submission::Submission::new(self.cuda_stream.clone())),
+            recording: self.recording,
+        };
+        let result = acquire(&staged).and_then(|()| self.submission.absorb(&staged.submission));
+        if result.is_err() {
+            // SAFETY: the caller guarantees that `acquire` enqueued no GPU
+            // work, so nothing on the device uses the resources held only by
+            // the staging submission.
+            unsafe { staged.complete() };
+        }
+        result
     }
 
     pub(crate) fn fresh_submission(&self) -> Self {

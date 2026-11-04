@@ -129,6 +129,44 @@ impl Submission {
         std::mem::take(&mut *self.recorded.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Moves every owner and recorded resource of `staged` into this
+    /// submission, leaving `staged` empty. Used to commit acquisitions that
+    /// were staged privately once all of them succeeded. Each staged vector
+    /// whose counterpart here is still empty is moved over without copying.
+    ///
+    /// Fails, leaving `staged` untouched, if this submission has already
+    /// completed.
+    pub(crate) fn absorb(&self, staged: &Submission) -> Result<(), DeviceError> {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let target = owners.set()?;
+        let source = staged
+            .owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set()
+            .map(std::mem::take)?;
+        // Usually one side is empty (a launch's leases go into a submission
+        // that so far holds only owners): move the staged vector over instead
+        // of growing a new one.
+        if target.leases.is_empty() {
+            target.leases = source.leases;
+        } else {
+            target.leases.extend(source.leases);
+        }
+        if target.others.is_empty() {
+            target.others = source.others;
+        } else {
+            target.others.extend(source.others);
+        }
+        drop(owners);
+        let recorded = staged.take_recorded();
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(recorded);
+        Ok(())
+    }
+
     /// Releases tracking; no further work may use this submission.
     ///
     /// # Safety

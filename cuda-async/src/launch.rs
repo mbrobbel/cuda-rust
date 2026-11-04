@@ -582,17 +582,12 @@ impl<'a> AsyncKernelLaunch<'a> {
             ));
         }
         stream.context().bind_to_thread()?;
-        // Register before enqueue: partial failures, unwind and forgotten futures
-        // must not shorten the lifetime of any argument or module.
-        ctx.retain(self.func.clone())?;
-        for (storage, write) in &self.resources {
-            ctx.retain_buffer(storage.clone(), *write)?;
-        }
         let cfg = self.cfg;
         let function = self.func.clone();
         let cluster = self.cluster_dim;
         let cooperative = self.cooperative;
         let pdl = self.programmatic_dependent_launch;
+        // Validate before acquiring: a rejected launch takes no leases.
         if pdl {
             let architecture = cuda_core::get_device_sm_name(stream.context().cu_device())?;
             let sm: u32 = architecture
@@ -603,6 +598,32 @@ impl<'a> AsyncKernelLaunch<'a> {
                 return Err(DeviceError::Launch(format!(
                     "programmatic dependent launch requires sm_90 or newer; target {architecture}"
                 )));
+            }
+        }
+        // Register before enqueue: partial failures, unwind and forgotten futures
+        // must not shorten the lifetime of any argument or module. The function
+        // is an owner, not an access lease, so keeping it past a rejection
+        // excludes nothing.
+        ctx.retain(self.func.clone())?;
+        // Buffer acquisition is all-or-nothing, so an argument rejected by an
+        // access conflict releases the leases this launch already took instead
+        // of leaving them on `ctx` until the stream's unrelated queued work
+        // completes. A single acquisition is all-or-nothing by itself and
+        // needs no staging.
+        match self.resources.as_slice() {
+            [] => {}
+            [(storage, write)] => ctx.retain_buffer(storage.clone(), *write)?,
+            resources => {
+                // SAFETY: acquiring buffer accesses only registers leases and
+                // owners; no GPU work is enqueued.
+                unsafe {
+                    ctx.retain_all(|staged| {
+                        for (storage, write) in resources {
+                            staged.retain_buffer(storage.clone(), *write)?;
+                        }
+                        Ok(())
+                    })?;
+                }
             }
         }
         self.args

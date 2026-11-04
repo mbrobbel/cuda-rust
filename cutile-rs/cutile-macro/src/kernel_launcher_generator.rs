@@ -540,6 +540,7 @@ pub fn generate_kernel_launcher(
     let mut spec_ref_exprs: Vec<String> = vec![];
     let mut scalar_hint_exprs: Vec<String> = vec![];
     let mut scalar_hint_value_exprs: Vec<String> = vec![];
+    let mut retain_statements = vec![];
     let mut builder_statements = vec![];
     let mut launch_grid_expr_strs = vec![];
     let mut validator_statements = vec![];
@@ -565,6 +566,7 @@ pub fn generate_kernel_launcher(
                 stride_args.push(res.stride_expr_str);
                 spec_args.push(res.spec_expr_str);
                 spec_ref_exprs.push(res.spec_ref_expr_str);
+                retain_statements.extend(res.retain_statements);
                 builder_statements.extend(res.builder_statements);
                 launch_grid_expr_strs.extend(res.launch_grid_expr_strs);
                 validator_statements.extend(res.validator_statements.block.stmts);
@@ -581,6 +583,7 @@ pub fn generate_kernel_launcher(
                     stride_args.push(res.stride_expr_str);
                     spec_args.push(res.spec_expr_str);
                     spec_ref_exprs.push(res.spec_ref_expr_str);
+                    retain_statements.extend(res.retain_statements);
                     builder_statements.extend(res.builder_statements);
                     launch_grid_expr_strs.extend(res.launch_grid_expr_strs);
                     validator_statements.extend(res.validator_statements.block.stmts);
@@ -1062,9 +1065,32 @@ pub fn generate_kernel_launcher(
             .to_string(),
     ));
 
-    let mut launch_only_stmts: Vec<Stmt> = vec![parse_stmt(
+    let mut launch_only_stmts: Vec<Stmt> = vec![];
+    if !retain_statements.is_empty() {
+        // Retain every tensor all-or-nothing: a launch rejected on a later
+        // tensor (for example by an access conflict with another stream)
+        // releases what earlier tensors registered at once, instead of
+        // leaving those leases until the stream's unrelated work completes.
+        launch_only_stmts.extend(
+            syn::parse2::<ExprBlock>(quote! {{
+                // SAFETY: the `KernelInputStored` and `KernelOutputStored`
+                // contracts limit `retain` to registering storage and access
+                // with `ctx`; it enqueues no GPU work.
+                unsafe {
+                    ctx.retain_all(|ctx| {
+                        #(#retain_statements)*
+                        Ok(())
+                    })?;
+                }
+            }})
+            .unwrap()
+            .block
+            .stmts,
+        );
+    }
+    launch_only_stmts.push(parse_stmt(
         "let mut kernel_launch = AsyncKernelLaunchBuilder::new(function.clone());".to_string(),
-    )];
+    ));
     launch_only_stmts.extend(builder_statements);
     launch_only_stmts.extend(
         syn::parse2::<ExprBlock>(quote! {{
@@ -1407,6 +1433,7 @@ pub struct KernelInputInfo {
 ///
 /// - `fn_arg`: The launcher function parameter (e.g., `x: Arc<Tensor<T>>`)
 /// - `stride_expr_str`: Expression string for computing tensor strides
+/// - `retain_statements`: Statements retaining the tensor for the launch
 /// - `builder_statements`: Statements to add to the kernel builder
 /// - `launch_grid_expr_strs`: Expressions for computing launch grid dimensions
 struct TensorLaunchCode {
@@ -1415,6 +1442,9 @@ struct TensorLaunchCode {
     spec_expr_str: String,
     /// Borrowed form of the same spec, for the launch-site probe: no clone.
     spec_ref_expr_str: String,
+    /// Statements registering the tensor's storage and access with the
+    /// staged launch context, run all-or-nothing before the builder.
+    retain_statements: Vec<Stmt>,
     builder_statements: Vec<Stmt>,
     launch_grid_expr_strs: Vec<String>,
     validator_statements: ExprBlock,
@@ -1841,10 +1871,11 @@ fn get_tensor_code(
     };
     // Builder and validator statements.
     let var_ident = Ident::new(var_name, Span::call_site());
+    let mut retain_statements = vec![];
     let mut builder_statements = vec![];
     let mut launch_grid_expr_strs = vec![];
     let validator_statements = if ty.mutability.is_some() {
-        builder_statements.push(parse_stmt(format!(
+        retain_statements.push(parse_stmt(format!(
             "KernelOutputStored::retain(&{var_name}, ctx)?;"
         )));
         builder_statements.push(parse_stmt(format!(
@@ -1877,7 +1908,7 @@ fn get_tensor_code(
         }})
         .unwrap()
     } else {
-        builder_statements.push(parse_stmt(format!(
+        retain_statements.push(parse_stmt(format!(
             "KernelInputStored::retain(&{var_name}, ctx)?;"
         )));
         builder_statements.push(parse_stmt(format!(
@@ -1927,6 +1958,7 @@ fn get_tensor_code(
         stride_expr_str,
         spec_expr_str,
         spec_ref_expr_str,
+        retain_statements,
         builder_statements,
         launch_grid_expr_strs,
         validator_statements,

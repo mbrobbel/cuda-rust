@@ -225,6 +225,69 @@ fn forgotten_borrowed_kernel_retains_inputs_outputs_and_excludes_conflicts() {
     });
 }
 
+/// A tile kernel launch rejected on a later tensor argument releases the
+/// access it already took on an earlier one at once. The output `dst` is
+/// retained before the input `src`, and `src` has a write in flight on
+/// `other`, so the launch fails before anything is enqueued. `dst` must then
+/// be usable from `other` while `stream` is still gated, instead of staying
+/// leased until the unrelated work queued on `stream` completes.
+#[test]
+fn rejected_kernel_launch_releases_earlier_tensor_accesses() {
+    on_gpu(|stream, other| {
+        let (mut src, _src_owner) = tracked(&stream);
+        let (mut dst, _dst_owner) = tracked(&stream);
+        let mut scratch = api::zeros::<f32>(&[32]).sync_on(&other).unwrap();
+        // Compile and load both specializations before any stream is gated.
+        kernels::copy((&mut src).partition([4]), &scratch)
+            .sync_on(&other)
+            .unwrap();
+        kernels::copy((&mut dst).partition([4]), &src)
+            .sync_on(&stream)
+            .unwrap();
+        let writer_gate = Gate::arm(&other);
+        forget_pending(
+            kernels::copy((&mut src).partition([4]), &scratch),
+            &other,
+            &writer_gate,
+        );
+        let gate = Gate::arm(&stream);
+        let mut launch = DeviceFuture::scheduled(
+            kernels::copy((&mut dst).partition([4]), &src),
+            ExecutionContext::new(stream.clone()),
+        );
+        let waker = noop_waker();
+        let outcome = Pin::new(&mut launch).poll(&mut Context::from_waker(&waker));
+        let Poll::Ready(Err(error)) = outcome else {
+            panic!("the launch must be rejected by the in-flight write of src");
+        };
+        assert!(
+            error.to_string().contains("conflicting in-flight access"),
+            "the launch must be rejected by the in-flight write of src, got {error}"
+        );
+        drop(launch);
+        // Only the forgotten write of `src` stays in flight on `other`.
+        drop(writer_gate);
+        other.synchronize().unwrap();
+        // Nothing touching `dst` was enqueued on the still-gated `stream`.
+        let read = api::memcpy(&mut scratch, &dst).sync_on(&other);
+        let write = api::memcpy(&mut dst, &scratch).sync_on(&other);
+        let still_gated = matches!(stream.query(), Ok(false)) && !gate.expired();
+        drop(gate);
+        stream.synchronize().unwrap();
+        assert!(still_gated, "the gate opened before dst was probed");
+        assert!(
+            read.is_ok(),
+            "dst is still leased by the rejected launch: read on other got {:?}",
+            read.err()
+        );
+        assert!(
+            write.is_ok(),
+            "dst is still leased by the rejected launch: write on other got {:?}",
+            write.err()
+        );
+    });
+}
+
 #[test]
 fn forgotten_view_and_mapped_output_keep_their_storage() {
     on_gpu(|stream, _| {

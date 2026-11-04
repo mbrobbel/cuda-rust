@@ -158,12 +158,15 @@ completion releases submission owners before returning the result.
 `mem::forget(future)` deliberately leaks those owners and their device access
 leases. It does not cancel work or release the leases when the GPU finishes.
 Same-stream use remains ordered, and concurrent reads are allowed; conflicting
-access on another stream returns an error. Await or drop a future normally to
-release its leases. Mutable partitions and `memcpy` destinations must also have
-unique user-visible storage; internal submission owners do not count as aliases.
+access on another stream returns an error. A kernel launch or graph replay
+rejected this way enqueues nothing and releases the accesses it already
+acquired. Await or drop a future normally to release its leases. Mutable
+partitions and `memcpy` destinations must also have unique user-visible
+storage; internal submission owners do not count as aliases.
 
 Custom `KernelInputStored` and `KernelOutputStored` implementations
-must implement `retain`. Custom `DeviceOp`s must register owned resources with
+must implement `retain`, which registers storage and access but must not
+enqueue GPU work. Custom `DeviceOp`s must register owned resources with
 `ExecutionContext::retain` before enqueueing work. The unsafe `async_on` escape
 hatch leaves resource lifetime and access ordering to its caller. On return,
 including an error, it releases registered owners and access leases without

@@ -2060,7 +2060,9 @@ pub enum GridBound {
 /// completion even if this binding or its future is dropped or forgotten. A
 /// Rust borrow or ownership of the binding alone is insufficient. In particular,
 /// relabelling a `Tensor<bool>` as byte output is unsound: a byte kernel could
-/// write an invalid boolean representation.
+/// write an invalid boolean representation. `retain` must not enqueue GPU work:
+/// a launch rejected on a later argument releases what `retain` registered
+/// before returning.
 pub unsafe trait KernelOutputStored<T: DType>: Send {
     /// Retain storage and acquire exclusive device access before enqueueing.
     fn retain(&self, ctx: &ExecutionContext) -> Result<(), DeviceError>;
@@ -2380,6 +2382,8 @@ impl<'a, T: DType> KernelOutput<T> for MappedLaunchPartition<Partition<&'a mut T
 /// graph replay retention when capturing. Storage and access protection must
 /// survive until GPU completion even if the binding or future is dropped or
 /// forgotten; borrowing the input or holding it in the binding is insufficient.
+/// `retain` must not enqueue GPU work: a launch rejected on a later argument
+/// releases what `retain` registered before returning.
 pub unsafe trait KernelInputStored: Send {
     /// Retain storage and acquire shared device access before enqueueing.
     fn retain(&self, ctx: &ExecutionContext) -> Result<(), DeviceError>;

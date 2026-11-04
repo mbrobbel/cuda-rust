@@ -376,10 +376,19 @@ impl DeviceOp for GraphLaunch {
         context.retain(self.exec.clone())?;
         // Reacquire every captured buffer for this replay: one lease per
         // distinct storage, registered on the launch submission so other
-        // streams see the replay's in-flight accesses.
+        // streams see the replay's in-flight accesses. All-or-nothing: a
+        // replay rejected on one buffer releases the leases it already took
+        // instead of leaving them until the stream's queued work completes.
         if let Some(captured) = self.exec.captured.get() {
-            for resource in captured {
-                resource.retain_for_launch(context)?;
+            // SAFETY: `ReplayResource::retain_for_launch` only registers the
+            // access and enqueues no GPU work (see its contract).
+            unsafe {
+                context.retain_all(|staged| {
+                    for resource in captured {
+                        resource.retain_for_launch(staged)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         // Pending updates need not accumulate over the graph's lifetime.

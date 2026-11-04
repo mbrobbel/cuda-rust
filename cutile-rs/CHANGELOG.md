@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A kernel launch, Tile kernel launch or graph replay rejected while acquiring
+  its arguments, for example by an access conflict with another stream,
+  releases the accesses it already acquired immediately. Before, they stayed
+  leased until all work queued on the launch stream completed, blocking other
+  streams from buffers the launch never used. `KernelInputStored::retain` and
+  `KernelOutputStored::retain` must not enqueue GPU work.
 - CUDA bindings resolve forward-declared struct definitions correctly with
   libclang 22 instead of emitting an empty placeholder with the wrong layout.
 - Retiring tensor completion leases retain allocation access independently of
