@@ -39,8 +39,9 @@ eagerly at the call site.
 
 The DeviceOperation lifecycle. Phase 1: a typed async method builds a lazy recipe
 (no GPU work). Phase 2: the scheduling policy picks a stream from its
-pool. Phase 3: `execute()` submits GPU work and a `cuLaunchHostFunc` callback.
-Phase 4: the callback fires, wakes the async runtime, and delivers the result.
+pool. Phase 3: `execute()` submits GPU work; unless it finishes within a brief
+spin, a completion flag is armed behind it (the default reactor path). Phase 4:
+the flag lands, the reactor wakes the async task, and the result is delivered.
 Bottom: the four execution methods from simplest (`.sync()`) to most manual
 (`async_on`).
 ```
@@ -227,9 +228,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-While the GPU is working, the Tokio runtime is free to poll other tasks -- no
-thread sits idle waiting for hardware. This is the key to running multiple
-GPU pipelines concurrently, which we explore in
+While the GPU is working, the Tokio runtime is free to poll other tasks -- apart
+from a brief inline spin on the first poll, no executor thread is blocked
+waiting for hardware. This is the key to running multiple GPU pipelines
+concurrently, which we explore in
 [Concurrent Execution](concurrent-execution.md).
 
 ### `.sync_on(&stream)` -- you choose the stream
@@ -339,40 +341,74 @@ hood. The operation becomes a `DeviceFuture` -- a type that implements Rust's
 `std::future::Future` -- and the async runtime polls it. But how does a poll-
 based system know when *hardware* has finished its work?
 
-The answer is `cuLaunchHostFunc`, a CUDA driver API that enqueues a host-side
-callback into a stream. When all preceding GPU work on that stream finishes,
-the driver calls the callback on a driver thread. cuda-oxide uses this to build
-a zero-busy-wait bridge between CUDA and Rust's async model.
+The answer is a completion flag that the GPU itself writes. After the work,
+cuda-async enqueues a `cuStreamWriteValue32` on the **same stream**, which
+stores to a slot of pinned host memory. CUDA guarantees stream ordering, so the
+write does not happen until all preceding work on that stream has finished.
+One process-wide `cuda-async-reactor` thread watches the armed slots and wakes
+the futures whose flags have landed.
 
-The `DeviceFuture` is a three-state machine:
+The `DeviceFuture` is a small state machine (errors aside):
 
 ```text
-  Idle ───poll()───► Executing ───callback fires───► Complete
-                         │                               │
-                   (submit GPU work               (return result
-                    + enqueue callback)             to the runtime)
+  Idle ───poll()───► Executing ──poll sees done──► Complete
+   │                     │                          ▲    │
+   │               (submit GPU work;                │   (return result
+   │                spin missed:                    │    to the runtime)
+   │                arm completion signal)          │
+   └────── poll(): work done within the spin ───────┘
 ```
 
 On the **first poll**, the future:
 
 1. Calls `execute()` on the operation, submitting GPU work to the stream.
-2. Enqueues a `cuLaunchHostFunc` callback on the **same stream**, right after
-   the GPU work. CUDA guarantees stream ordering: this callback will not fire
-   until the kernel finishes.
-3. Returns `Poll::Pending`. The async runtime parks the task and moves on.
+2. Spins briefly on `cuStreamQuery`, inside `poll()` on the executor thread.
+   For microsecond-scale work, spinning is cheaper than a wake-up round trip
+   (reactor → waker → executor → re-poll), so if the stream is idle within the
+   budget (`CUDA_ASYNC_SPIN_BUDGET_US`, default 20 µs) the future returns
+   `Poll::Ready` right away. The spin blocks the executor thread for about
+   that budget; the deadline is checked between `cuStreamQuery` calls.
+3. Otherwise, on the default reactor path, enqueues a `cuStreamWriteValue32`
+   into a pinned flag slot right after the GPU work, registers the slot with
+   the reactor, and returns `Poll::Pending`. The async runtime parks the task
+   and moves on. (The note below covers the host-callback fallback.)
 
-When the **GPU finishes** the kernel, the CUDA driver calls the host callback
-on a driver thread. The callback sets an `AtomicBool` flag and wakes the
-task's `AtomicWaker`. The async runtime notices the wake and re-polls the
-future.
+When the **GPU finishes** the work, the stream writes the flag. The reactor
+thread, which scans the armed slots with plain memory loads, sees it, marks
+the operation complete and wakes the task's `AtomicWaker`. The async runtime
+notices the wake and re-polls the future.
 
-On the **second poll**, the future sees the flag and returns
+On the **second poll**, the future sees the completion and returns
 `Poll::Ready(Ok(result))`. The task resumes with the value.
 
-The critical property: **no host thread spins or sleeps** while the GPU works.
-The async executor is free to run other tasks -- including other `DeviceFuture`s
-on other streams. This is how cuda-oxide achieves true concurrent execution
+The critical property: **there is no thread per operation**. On the default
+reactor path, apart from the bounded inline spin, the only host thread involved
+is the single shared reactor. While any operation is in flight it busy-polls the
+armed slots (spinning, then yielding between scans), so it keeps a CPU core
+busy, though it yields to other runnable threads; it parks when nothing is
+armed. The async executor is free to run other tasks -- including other
+`DeviceFuture`s on other streams -- and the wake-up cost is amortized across
+every in-flight pipeline. This is how cuda-oxide achieves concurrent execution
 without dedicating a thread per GPU operation.
+
+`DeviceFuture` only needs a `Waker`, so it works on any async executor: Tokio,
+`futures::executor::block_on`, or your own. cuda-async does not depend on Tokio.
+
+:::{note}
+If the reactor cannot take an operation (for example, its slot pool is
+exhausted, it failed to start, or the flag write cannot be enqueued because the
+device does not support stream memory operations), the future falls back to a
+`cuLaunchHostFunc` host callback on the same stream. Setting
+`CUDA_ASYNC_HOST_SYNC=spin` or `CUDA_ASYNC_HOST_SYNC=block` bypasses the reactor
+and uses that callback for every operation that outlasts the inline spin, which
+is useful for comparing the completion paths. The driver does not run host
+callbacks on a faulted context, so a future waiting on a callback may not
+resolve after a device fault; the reactor path detects faults and wakes the
+future, which then observes the error. See the
+[cuda-async README](https://github.com/NVIDIA/cuda-rust/blob/main/cuda-async/README.md)
+("Execution and Completion") for the details, including how device faults
+reach a waiting future.
+:::
 
 :::{seealso}
 The [Combinators and Composition](combinators-and-composition.md) chapter shows

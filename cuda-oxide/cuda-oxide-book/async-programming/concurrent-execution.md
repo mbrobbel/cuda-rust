@@ -148,13 +148,17 @@ Let's unpack what happens here:
    poll it when the executor has capacity. On the first poll, the pipeline's
    `execute()` runs, submitting all the GPU work to the assigned stream.
 
-4. **The runtime is free.** After the first poll, the task is parked. The GPU
-   is crunching numbers on four streams simultaneously. No host thread sits
-   waiting.
+4. **The runtime is free.** Unless the work finished within the brief inline
+   spin, the first poll returns `Poll::Pending` and the task is parked. The GPU
+   is crunching numbers on four streams simultaneously. No executor thread
+   is blocked waiting; by default, the one shared cuda-async reactor thread
+   watches all four pipelines.
 
-5. **When the GPU finishes** a pipeline's work, the `cuLaunchHostFunc` callback
-   fires, waking the corresponding Tokio task. The runtime re-polls it,
-   delivering the `Vec<f32>` result.
+5. **When the GPU finishes** a pipeline's work, the corresponding Tokio task
+   is woken. On the default reactor path, the stream writes the pipeline's
+   completion flag and the reactor thread wakes the task; on the
+   host-callback fallback, a `cuLaunchHostFunc` callback wakes it instead.
+   The runtime re-polls the task, delivering the `Vec<f32>` result.
 
 ## Step 4: Collect results
 

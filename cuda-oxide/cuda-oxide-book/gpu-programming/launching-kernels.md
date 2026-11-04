@@ -661,7 +661,7 @@ operation.
 | Method    | What it does                                                                      |
 |:----------|:----------------------------------------------------------------------------------|
 | `.sync()` | Execute on the default scheduling policy, block the current thread until complete |
-| `.await`  | Execute and yield the current async task (requires a Tokio runtime)               |
+| `.await`  | Execute and yield the current async task (any async executor, e.g. Tokio)         |
 
 ## Composing GPU work
 

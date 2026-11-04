@@ -116,13 +116,13 @@
       <rect x="20" y="86" width="120" height="22" rx="4" fill="#f97583" opacity="0.7"/>
       <text x="80" y="101" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">kernel</text>
       <rect x="148" y="86" width="76" height="22" rx="4" fill="#e8912d" opacity="0.7"/>
-      <text x="186" y="101" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">callback</text>
+      <text x="186" y="101" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">flag write</text>
 
       <!-- Code -->
       <rect x="12" y="122" width="224" height="80" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
       <text x="24" y="142" font-family="'RobotoMono', monospace" font-size="11" fill="#f97583">execute(ctx)</text>
       <text x="24" y="162" font-family="'RobotoMono', monospace" font-size="10" fill="#c9d1d9">&#x2192; submit kernel</text>
-      <text x="24" y="182" font-family="'RobotoMono', monospace" font-size="10" fill="#e8912d">&#x2192; cuLaunchHostFunc</text>
+      <text x="24" y="182" font-family="'RobotoMono', monospace" font-size="10" fill="#e8912d">&#x2192; spin, else arm flag</text>
 
       <!-- Status -->
       <rect x="3" y="246" width="3" height="44" rx="1" fill="#f97583" opacity="0.6"/>
@@ -142,9 +142,9 @@
       <text x="56" y="36" font-size="16" font-weight="700" fill="#d2a8ff">Complete</text>
       <text x="124" y="56" text-anchor="middle" font-size="12" font-weight="600" fill="#b1bac4">Serve the result</text>
 
-      <!-- Callback -> Wake flow -->
+      <!-- Flag -> Wake flow -->
       <rect x="16" y="76" width="216" height="32" rx="6" fill="rgba(232, 145, 45, 0.12)" stroke="#e8912d" stroke-width="1"/>
-      <text x="124" y="97" text-anchor="middle" font-size="11" font-weight="600" fill="#e8912d">GPU done &#x2192; callback fires</text>
+      <text x="124" y="97" text-anchor="middle" font-size="11" font-weight="600" fill="#e8912d">GPU writes flag &#x2192; reactor wakes</text>
 
       <line x1="124" y1="108" x2="124" y2="124" stroke="#c9d1d9" stroke-width="1.5" opacity="0.6"/>
       <polygon points="118,122 124,130 130,122" fill="#c9d1d9" opacity="0.6"/>
@@ -160,8 +160,8 @@
 
       <!-- Status -->
       <rect x="3" y="246" width="3" height="44" rx="1" fill="#d2a8ff" opacity="0.6"/>
-      <text x="18" y="264" font-size="12" font-weight="600" fill="#d2a8ff">Zero-busy-wait delivery</text>
-      <text x="18" y="282" font-size="11" fill="#9ca3af">No thread spins or sleeps</text>
+      <text x="18" y="264" font-size="12" font-weight="600" fill="#d2a8ff">One shared reactor thread</text>
+      <text x="18" y="282" font-size="11" fill="#9ca3af">No thread per operation</text>
     </g>
   </g>
 
@@ -203,7 +203,7 @@
       <text x="68" y="120" text-anchor="middle" font-size="8" font-weight="700" fill="#fff">GPU work</text>
       <rect x="118" y="108" width="136" height="16" rx="3" fill="#56d364" opacity="0.2"/>
       <text x="186" y="120" text-anchor="middle" font-size="8" font-weight="600" fill="#56d364">thread free</text>
-      <text x="18" y="148" font-size="11" font-weight="600" fill="#9ca3af">Tokio, concurrent workloads</text>
+      <text x="18" y="148" font-size="11" font-weight="600" fill="#9ca3af">Async executors, concurrent workloads</text>
     </g>
 
     <!-- .sync_on(&stream) (Amber) -->

@@ -156,12 +156,13 @@ Calling it twice on the same thread returns an error.
 :align: center
 :width: 100%
 
-Left: the DeviceFuture three-state machine. On the first poll, GPU work and a
-`cuLaunchHostFunc` callback are submitted — then `Poll::Pending` is returned.
-When the GPU finishes, the callback sets an `AtomicBool` and wakes the task.
-On the second poll, the result is delivered. Right: comparison of `.sync()`
-(thread blocked the entire time) vs `.await` (thread runs other tasks while
-the GPU works).
+Left: the DeviceFuture state machine. On the first poll, GPU work is submitted;
+unless it finishes within a brief spin, a `cuStreamWriteValue32` completion flag
+is armed behind it (the default reactor path) and `Poll::Pending` is returned.
+When the GPU finishes, the flag lands and the cuda-async reactor thread wakes
+the task. On the second poll, the result is delivered. Right: comparison of
+`.sync()` (thread blocked the entire time) vs `.await` (thread runs other tasks
+while the GPU works).
 ```
 
 Here is the full journey of an operation from construction to completion:
@@ -182,25 +183,28 @@ module.kernel_async(&prepared, ...)  ← build a checked recipe (no GPU work)
         │  first poll()
         ▼
   execute() on stream 2        ← GPU work is submitted
-  cuLaunchHostFunc on stream 2 ← host callback enqueued after the kernel
+  brief cuStreamQuery spin     ← Poll::Ready now if the GPU is already done
+  otherwise:
+  cuStreamWriteValue32 flag    ← completion flag write enqueued on stream 2
   return Poll::Pending
         │
-        │  ... GPU is working, host thread is free ...
+        │  ... GPU is working, your thread is free ...
         │
-        │  callback fires on a CUDA driver thread
-        │  → sets AtomicBool, wakes AtomicWaker
+        │  GPU writes the flag after the kernel
+        │  → reactor thread sees the flag, wakes AtomicWaker
         │
         │  second poll()
         ▼
   return Poll::Ready(Ok(()))   ← result delivered to the caller
 ```
 
-The key insight is that between the first `poll()` and the callback, **no host
-thread is occupied**. The async runtime parks the task and runs other tasks.
-The GPU notifies the runtime when it is done, via the `cuLaunchHostFunc`
-callback. This is why `.await` scales better than `.sync()` for concurrent
-workloads -- you can have dozens of in-flight operations without tying up a
-thread for each one.
+The key insight is that between the first `poll()` and the wake-up, **no
+thread is held for this operation**. The async runtime parks the task and runs
+other tasks. The GPU signals completion by writing the flag, and the one
+shared reactor thread turns that into a wake-up for every in-flight operation.
+This is why `.await` scales better than `.sync()` for concurrent workloads --
+you can have dozens of in-flight operations without tying up a thread for each
+one.
 
 ## Manual stream control
 

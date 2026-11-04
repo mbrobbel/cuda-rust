@@ -554,7 +554,7 @@ let op = unsafe {
 }?;
 
 op.sync()?;       // blocking
-// or: op.await?;  // async with tokio
+// or: op.await?;  // async, on any executor
 ```
 
 Raw generated calls are unsafe because `LaunchConfig` is not tied to a kernel.

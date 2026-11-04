@@ -90,8 +90,11 @@ handles.push(tokio::spawn(pipeline.into_future()));
 
 `tokio::spawn` hands the task to the executor immediately. The executor polls
 it on a worker thread, which submits the entire operation chain onto a CUDA
-stream and registers a host callback. The future returns `Poll::Pending` and
-is woken when the GPU signals completion.
+stream. Unless the work finishes within a brief inline spin, the future by
+default arms a completion flag behind it and returns `Poll::Pending`; the
+shared cuda-async reactor thread wakes it when the GPU writes that flag. (When
+the reactor is unavailable, or `CUDA_ASYNC_HOST_SYNC` selects it, a host
+callback signals completion instead.)
 
 By the time the loop reaches `handle.await`, the GPU has typically already
 finished (especially for small workloads). The `.await` just picks up the

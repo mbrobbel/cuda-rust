@@ -411,9 +411,11 @@ batch 1 → stream 1, round-robin). `tokio::spawn` hands the future to the
 Tokio runtime.
 
 On the first poll, the pipeline's `execute()` submits all GPU work to the
-assigned stream and registers a `cuLaunchHostFunc` callback. The future
-returns `Poll::Pending`. When the GPU finishes, the callback wakes the task.
-No host thread spins.
+assigned stream. Unless the work finishes within a brief inline spin, the future
+by default arms a completion flag (a `cuStreamWriteValue32` behind the work; a
+host callback is the fallback) and returns `Poll::Pending`. When the GPU
+finishes, the flag lands and the shared cuda-async reactor thread wakes the
+task. No thread is held per pipeline.
 
 ```rust
     for (i, handle) in handles.into_iter().enumerate() {

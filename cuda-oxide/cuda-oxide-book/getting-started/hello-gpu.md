@@ -196,7 +196,7 @@ When you pass structs to the GPU, cuda-oxide queries rustc for the **exact byte 
 
 ## Going async
 
-For multi-kernel pipelines or concurrent workloads, cuda-oxide provides an async execution model built on Tokio. Let's scaffold an async project and walk through the differences.
+For multi-kernel pipelines or concurrent workloads, cuda-oxide provides an executor-agnostic async execution model (the `--async` template uses Tokio). Let's scaffold an async project and walk through the differences.
 
 ### Create an async project
 

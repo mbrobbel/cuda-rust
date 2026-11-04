@@ -23,9 +23,9 @@
   <rect width="1260" height="960" fill="url(#grid)" opacity="0.5"/>
 
   <!-- Title -->
-  <text x="630" y="44" text-anchor="middle" font-size="28" font-weight="500" fill="#ffffff" letter-spacing="-0.5">DeviceFuture &#x2014; Zero-Busy-Wait GPU Completion</text>
+  <text x="630" y="44" text-anchor="middle" font-size="28" font-weight="500" fill="#ffffff" letter-spacing="-0.5">DeviceFuture &#x2014; Non-Blocking GPU Completion</text>
   <line x1="280" y1="58" x2="980" y2="58" stroke="url(#titleAccent)" stroke-width="2" opacity="0.8"/>
-  <text x="630" y="84" text-anchor="middle" font-size="16" fill="#b1bac4">cuLaunchHostFunc bridges CUDA streams to Rust&#x2019;s async model</text>
+  <text x="630" y="84" text-anchor="middle" font-size="16" fill="#b1bac4">A GPU-written completion flag bridges CUDA streams to Rust&#x2019;s async model</text>
 
   <!-- ==================== LEFT: State Machine ==================== -->
   <g transform="translate(40, 118)">
@@ -58,10 +58,10 @@
         <text x="110" y="24" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="11" fill="#f97583">execute(ctx) &#x2192; GPU work</text>
       </g>
 
-      <!-- Step 2: cuLaunchHostFunc -->
+      <!-- Step 2: arm the completion flag -->
       <g transform="translate(260, 46)">
         <rect width="220" height="38" rx="6" fill="rgba(232, 145, 45, 0.12)" stroke="#e8912d" stroke-width="1"/>
-        <text x="110" y="24" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="11" fill="#e8912d">cuLaunchHostFunc</text>
+        <text x="110" y="24" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="11" fill="#e8912d">spin miss &#x2192; arm flag</text>
       </g>
 
       <!-- Stream visualization -->
@@ -70,11 +70,13 @@
       <rect x="95" y="100" width="160" height="22" rx="4" fill="#f97583" opacity="0.6"/>
       <text x="175" y="116" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">kernel work</text>
       <rect x="260" y="100" width="100" height="22" rx="4" fill="#e8912d" opacity="0.6"/>
-      <text x="310" y="116" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">host callback</text>
+      <text x="310" y="116" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">flag write</text>
 
       <!-- Return value -->
       <rect x="120" y="140" width="260" height="32" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-      <text x="250" y="161" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="12" fill="#e8912d">return Poll::Pending</text>
+      <text x="250" y="161" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="12" fill="#e8912d">spin missed &#x2192; Poll::Pending</text>
+      <text x="388" y="160" font-size="10" fill="#9ca3af">spin hit &#x2192;</text>
+      <text x="388" y="174" font-size="10" fill="#9ca3af">Ready at once</text>
 
       <text x="250" y="196" text-anchor="middle" font-size="12" font-weight="600" fill="#9ca3af">Host thread is free &#x2014; runtime runs other tasks</text>
     </g>
@@ -85,9 +87,9 @@
     <!-- GPU COMPLETION flash -->
     <g transform="translate(110, 488)">
       <rect width="440" height="84" rx="10" fill="rgba(249, 117, 131, 0.06)" stroke="#f97583" stroke-width="1.5" stroke-dasharray="6,3"/>
-      <text x="220" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="#f97583">GPU Finishes &#x2192; Driver Calls Callback</text>
+      <text x="220" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="#f97583">GPU Writes Flag &#x2192; Reactor Wakes Task</text>
       <text x="220" y="50" text-anchor="middle" font-family="'RobotoMono', monospace" font-size="11" fill="#c9d1d9">AtomicBool::store(true) + AtomicWaker::wake()</text>
-      <text x="220" y="72" text-anchor="middle" font-size="11" fill="#9ca3af">Runs on a CUDA driver thread, not your thread</text>
+      <text x="220" y="72" text-anchor="middle" font-size="11" fill="#9ca3af">Runs on the shared cuda-async-reactor thread, not yours</text>
     </g>
 
     <!-- Arrow: runtime re-polls -->
@@ -106,7 +108,7 @@
     <!-- Critical property callout -->
     <g transform="translate(30, 748)">
       <rect width="600" height="30" rx="6" fill="rgba(88, 209, 219, 0.08)" stroke="#58d1db" stroke-width="1"/>
-      <text x="300" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#58d1db">No host thread spins or sleeps while the GPU works</text>
+      <text x="300" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#58d1db">No thread per operation: one shared reactor wakes every future</text>
     </g>
   </g>
 
@@ -166,11 +168,11 @@
       <rect x="0" y="134" width="450" height="24" rx="4" fill="#30363d"/>
       <rect x="80" y="134" width="250" height="24" rx="4" fill="#f97583" opacity="0.5"/>
       <text x="205" y="150" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">kernel execution</text>
-      <!-- Callback marker -->
+      <!-- Completion flag marker -->
       <circle cx="330" cy="146" r="6" fill="#e8912d" stroke="#fff" stroke-width="1.5"/>
-      <text x="345" y="150" font-size="8" font-weight="600" fill="#e8912d">callback</text>
+      <text x="345" y="150" font-size="8" font-weight="600" fill="#e8912d">flag</text>
 
-      <!-- Callback arrow to thread -->
+      <!-- Reactor wake arrow to thread -->
       <line x1="340" y1="134" x2="370" y2="92" stroke="#e8912d" stroke-width="1.5" stroke-dasharray="3,2" opacity="0.7"/>
 
       <text x="225" y="190" text-anchor="middle" font-size="12" font-weight="600" fill="#58d1db">Thread runs other tasks while GPU works</text>
@@ -188,13 +190,13 @@
 
       <text x="16" y="86" font-size="12" fill="#c9d1d9">With</text>
       <text x="48" y="86" font-family="'RobotoMono', monospace" font-size="12" fill="#d2a8ff">.await</text>
-      <text x="96" y="86" font-size="12" fill="#c9d1d9">: 10 pipelines = 1 thread, 10 tasks</text>
+      <text x="96" y="86" font-size="12" fill="#c9d1d9">: 10 pipelines = 10 tasks, 1 reactor</text>
 
       <line x1="16" y1="104" x2="434" y2="104" stroke="#30363d" stroke-width="1"/>
 
-      <text x="16" y="126" font-size="11" fill="#b1bac4">The GPU notifies Rust via cuLaunchHostFunc.</text>
-      <text x="16" y="146" font-size="11" fill="#b1bac4">No polling loop, no busy-wait, no wasted CPU.</text>
-      <text x="16" y="166" font-size="11" fill="#b1bac4">The async runtime wakes only when work is done.</text>
+      <text x="16" y="126" font-size="11" fill="#b1bac4">The GPU writes a flag; one shared reactor wakes the task.</text>
+      <text x="16" y="146" font-size="11" fill="#b1bac4">No thread per pipeline; the reactor polls only while work is in flight.</text>
+      <text x="16" y="166" font-size="11" fill="#b1bac4">The reactor wakes the task when work is done or the stream faults.</text>
     </g>
   </g>
 </svg>
