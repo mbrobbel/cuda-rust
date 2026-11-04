@@ -1104,6 +1104,18 @@ fn translate_call(
                 legaliser,
             );
         }
+        // A `fn`-pointer receiver resolves to rustc's `FnPtrShim`, whose body
+        // calls through the pointer. Device `fn` pointers are identity tokens
+        // (see `translate_reify_fn_pointer`), not code addresses, and the
+        // collector never gathers the shim, so emitting the call would only
+        // dangle as a late module-verifier error. Refuse it here, at the
+        // caller. A diverging call keeps the trap fallback below, matching a
+        // diverging call through the pointer itself.
+        if target_usize.is_some()
+            && let Some(fn_ptr_ty) = operand_type(&args[0], body).and_then(fn_pointer_type)
+        {
+            return input_err!(loc, fn_pointer_call_unsupported(fn_ptr_ty));
+        }
     }
 
     // Per-loop unroll marker from `#[unroll]` / `#[unroll(N)]`. The enclosing
@@ -1423,8 +1435,26 @@ fn translate_call(
         );
     }
 
-    // Not an intrinsic - emit regular function call
-    let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
+    // Every callee left here must be named statically: a call is emitted
+    // against a symbol, and only a zero-sized `FnDef` constant names one.
+    // Any other callee operand is a runtime value. For a `fn` pointer that
+    // value is an identity token, not a code address, so there is nothing to
+    // call; refuse it here with the caller's location instead of emitting a
+    // placeholder symbol that only fails at module verification.
+    let Some(raw_name) = call_name else {
+        let callee_ty = func.ty(body.locals()).ok();
+        if let Some(fn_ptr_ty) = callee_ty.and_then(fn_pointer_type) {
+            return input_err!(loc, fn_pointer_call_unsupported(fn_ptr_ty));
+        }
+        let callee_ty = callee_ty.map_or_else(|| "<unknown>".to_string(), |ty| ty.to_string());
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "callee of type `{callee_ty}` is not a statically known function; \
+                 only direct calls can be emitted on the device"
+            ))
+        );
+    };
     let legal_name = legaliser.legalise(&raw_name);
 
     // Foreign items have no `mir.func` body to provide an independent symbol
@@ -2214,6 +2244,36 @@ fn function_item_call_name(instance: rustc_public::mir::mono::Instance) -> Strin
 
 fn operand_type(receiver: &mir::Operand, body: &mir::Body) -> Option<rustc_public::ty::Ty> {
     receiver.ty(body.locals()).ok()
+}
+
+/// Return the `fn` pointer type behind `ty`, peeling any references.
+///
+/// Callable-trait receivers arrive by reference (`&mut fn(u32) -> u32` for
+/// `FnMut::call_mut`), while a direct call's callee is the pointer itself;
+/// both shapes resolve to the same `RigidTy::FnPtr` here.
+fn fn_pointer_type(ty: rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _)) => fn_pointer_type(inner),
+        TyKind::RigidTy(RigidTy::FnPtr(_)) => Some(ty),
+        _ => None,
+    }
+}
+
+/// Build the import-time diagnostic for a call through a `fn` pointer.
+///
+/// Shared by the direct-call path and the callable-trait (`FnPtrShim`) path
+/// so both spellings of the same unsupported construct report the same text,
+/// which `scripts/smoketest.sh` pins for the `error_fn_pointer_*` fixtures.
+fn fn_pointer_call_unsupported(fn_ptr_ty: rustc_public::ty::Ty) -> TranslationErr {
+    TranslationErr::unsupported(format!(
+        "calling through a function pointer (`{fn_ptr_ty}`) is not supported on the device: \
+         device fn pointers are identity tokens, not code addresses; call the function \
+         directly, pass the fn item or a closure to a generic `F: Fn(..)` parameter, or \
+         name a concrete callable type instead of a `fn(..)` pointer (for example in \
+         `Map<_, fn(..)>`)"
+    ))
 }
 
 struct CallableTraitCallInfo {

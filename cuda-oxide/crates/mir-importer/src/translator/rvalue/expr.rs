@@ -344,8 +344,10 @@ pub fn translate_rvalue(
             // that, `f == f` is true and two different functions compare
             // unequal (Rust permits, but does not promise, distinct fn
             // addresses, so a hash stand-in is within contract). CALLING
-            // through the pointer is still unsupported and fails loudly at
-            // the call site. Handled before translate_operand because the
+            // through the pointer is still unsupported: the call terminator
+            // refuses it at import time with a "calling through a function
+            // pointer" diagnostic naming the caller (a diverging call traps
+            // instead). Handled before translate_operand because the
             // zero-sized fn-item operand itself never becomes a value.
             if let mir::CastKind::PointerCoercion(mir::PointerCoercion::ReifyFnPointer(_)) = kind {
                 return translate_reify_fn_pointer(ctx, body, operand, ty, block_ptr, prev_op, loc);

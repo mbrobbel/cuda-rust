@@ -10,9 +10,9 @@
 //! (the pointer it coerces to). This pins both stable token-materialization
 //! paths even though nothing is ever CALLED through the pointer.
 //!
-//! Calling through a fn pointer is still unsupported; this example only
-//! pins that the types translate and a reflexive pointer comparison
-//! works.
+//! Calling through a fn pointer is still unsupported and is rejected at
+//! MIR import (see `error_fn_pointer_call`); this example only pins that
+//! the types translate and a reflexive pointer comparison works.
 //!
 //! Run with:
 //!   cargo oxide run fn_ptr_naming
