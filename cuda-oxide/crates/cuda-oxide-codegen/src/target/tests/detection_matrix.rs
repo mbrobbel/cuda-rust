@@ -173,6 +173,85 @@ fn f32x2_family_detection_handles_large_modules_and_late_matches() {
     assert_eq!(requirements.ptx_isa, PtxIsaRequirement::new(86));
 }
 
+/// 128-bit inline-asm operands need PTX ISA 8.3: the `.b128` type in a
+/// template, or a `q` register constraint, for which LLVM declares and moves a
+/// `.b128` register itself. Without a raised floor, sm_80 emitted `.version
+/// 7.0` and the module failed only at load time with a PTX JIT error.
+#[test]
+fn b128_inline_asm_raises_the_ptx_isa_floor() {
+    let raised = ModuleRequirements {
+        features: DetectedFeatures::Basic,
+        ptx_isa: PtxIsaRequirement::new(86),
+    };
+
+    for text in [
+        // The `ptx_asm!` load that found this, as the exported IR spells it.
+        r#"%v31 = call i128 asm sideeffect "ld.global.b128 $0, [$1];", "=q,l"(i64 %v30)"#,
+        // A `q` operand alone: the template never names `.b128`.
+        r#"call void asm sideeffect "// $0", "q"(i128 %x)"#,
+        r#"%r = call i128 asm sideeffect "// $0", "=q,0"(i128 %x)"#,
+        r#"%r = call i128 asm sideeffect "// $0 $1", "=&q,r"(i32 %x)"#,
+        r#"%r = call i32 asm "// $0 $1", "=r,q"(i128 %x)"#,
+        // A `.b128` template whose operands are all 64-bit.
+        r#"call void asm sideeffect "{ .reg .b128 t; mov.b128 t, {$0, $1}; }", "l,l"(i64 %a, i64 %b)"#,
+        r#"call void asm sideeffect "st.global.b128\09[$0], $1;", "l,q"(ptr %p, i128 %v)"#,
+        r#"module asm "mov.b128 %rq1, {%rd1, %rd2};""#,
+        // A raw PTX fragment rather than IR, which is how tests pass PTX.
+        "ld.global.b128 $0, [$1];",
+    ] {
+        assert_eq!(
+            detect_module_requirements_in_llvm_text(text),
+            raised,
+            "{text}"
+        );
+    }
+
+    // PTX 8.3 has no spelling of its own, so the floor rounds up to 8.6:
+    // raised on every target whose own floor is older, untouched otherwise.
+    for target in ["sm_75", "sm_80", "sm_86", "sm_90"] {
+        assert_eq!(
+            required_ptx_feature(&target.parse().unwrap(), raised.ptx_isa).unwrap(),
+            Some("+ptx86"),
+            "{target}"
+        );
+    }
+    for target in ["sm_100", "sm_120a"] {
+        assert_eq!(
+            required_ptx_feature(&target.parse().unwrap(), raised.ptx_isa).unwrap(),
+            None,
+            "{target}"
+        );
+    }
+
+    for near_miss in [
+        r#"%r = call i64 asm sideeffect "ld.global.b64 $0, [$1];", "=l,l"(i64 %p)"#,
+        r#"%r = call i64 asm sideeffect "ld.global.b1280 $0, [$1];", "=l,l"(i64 %p)"#,
+        "  ; ld.global.b128 $0, [$1];",
+        "@foo.b128 = internal global i32 0",
+        r#"@.msg = private constant [15 x i8] c"ld.global.b128\00""#,
+        r#"call void asm sideeffect "// q", "~{q}"()"#,
+        r#"call void asm sideeffect "// $0", "Q"(ptr %p)"#,
+        "%sum = add i128 %a, %b",
+    ] {
+        assert_eq!(
+            detect_module_requirements_in_llvm_text(near_miss).ptx_isa,
+            PtxIsaRequirement::Default,
+            "{near_miss}"
+        );
+    }
+
+    // The 8.3 floor composes with the others by maximum.
+    let older_floor = concat!(
+        r#"call void asm sideeffect "redux.sync.add.u32 $0, $1, $2;", "=r,r,r"(i32 %v, i32 %m)"#,
+        "\n",
+        r#"call void asm sideeffect "// $0", "q"(i128 %x)"#,
+    );
+    assert_eq!(
+        detect_module_requirements_in_llvm_text(older_floor).ptx_isa,
+        PtxIsaRequirement::new(86)
+    );
+}
+
 #[test]
 fn dense_bf16_mma_detection_applies_exact_sm80_and_ptx70_floors() {
     let mnemonic = "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {$0}, {$1}, {$2}, {$3};";

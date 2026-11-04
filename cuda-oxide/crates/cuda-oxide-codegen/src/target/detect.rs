@@ -143,6 +143,44 @@ fn ptx_contains_float_redux(ptx: &str) -> bool {
     })
 }
 
+/// Checks for 128-bit inline-asm operands, which need PTX ISA 8.3: a `.b128`
+/// type in an asm template, or a `q` register constraint. LLVM lowers a `q`
+/// operand through a `.b128` register it declares itself, so the constraint
+/// needs the same floor even when the template never names `.b128`. Decided
+/// on tokens, so comments, data strings, symbol names and `.b1280` do not
+/// count.
+fn contains_b128_features(contents: &str) -> bool {
+    let tokens = lex_llvm_ir(contents);
+    tokens.iter().enumerate().any(|(index, token)| match token {
+        IrToken::Word(word) if *word == "asm" => inline_asm_strings(&tokens[index + 1..])
+            .is_some_and(|(template, constraints)| {
+                ptx_contains_b128(&unescape_llvm_string(template))
+                    || constraints.is_some_and(|constraints| {
+                        constraints_contain_q(&unescape_llvm_string(constraints))
+                    })
+            }),
+        // A raw PTX fragment rather than IR, which is how tests pass PTX.
+        IrToken::Word(word) => ptx_contains_b128(word),
+        IrToken::Global(_) | IrToken::Label(_) | IrToken::String(_) => false,
+    })
+}
+
+/// Does this PTX contain a `.b128` modifier, on an instruction or in a
+/// `.reg` declaration? Both need PTX ISA 8.3.
+fn ptx_contains_b128(ptx: &str) -> bool {
+    ptx.contains(".b128") && lex_ptx(ptx).contains(&PtxToken::Modifier(".b128"))
+}
+
+/// Does this inline-asm constraint list bind an operand to a `q` (128-bit)
+/// register? Each comma-separated constraint is compared after its `=`,
+/// `+`, `&` and `*` prefixes, so `=q` and `=&q` count while a `~{q}` clobber
+/// or the unrelated `Q` does not.
+fn constraints_contain_q(constraints: &str) -> bool {
+    constraints
+        .split(',')
+        .any(|constraint| constraint.trim_start_matches(['=', '+', '&', '*']) == "q")
+}
+
 /// A PTX token. Whitespace, comments and string literals produce none.
 #[derive(Debug, PartialEq)]
 enum PtxToken<'a> {
@@ -227,6 +265,13 @@ fn lex_ptx(ptx: &str) -> Vec<PtxToken<'_>> {
 /// each optional and in that order, as `LLParser` accepts them. Also covers
 /// `module asm`.
 fn inline_asm_template<'a>(after_asm: &[IrToken<'a>]) -> Option<&'a str> {
+    inline_asm_strings(after_asm).map(|(template, _)| template)
+}
+
+/// The template and constraint list of an inline-asm expression, given the
+/// tokens after `asm`. The constraint list is the string right after the
+/// template (the lexer drops the comma between them); `module asm` has none.
+fn inline_asm_strings<'a>(after_asm: &[IrToken<'a>]) -> Option<(&'a str, Option<&'a str>)> {
     const MODIFIERS: [&str; 4] = ["sideeffect", "alignstack", "inteldialect", "unwind"];
     let mut tokens = after_asm.iter();
     let mut next = tokens.next();
@@ -235,10 +280,14 @@ fn inline_asm_template<'a>(after_asm: &[IrToken<'a>]) -> Option<&'a str> {
             next = tokens.next();
         }
     }
-    match next {
-        Some(IrToken::String(template)) => Some(template),
+    let Some(IrToken::String(template)) = next else {
+        return None;
+    };
+    let constraints = match tokens.next() {
+        Some(IrToken::String(constraints)) => Some(*constraints),
         _ => None,
-    }
+    };
+    Some((template, constraints))
 }
 
 /// An LLVM IR token. Comments, punctuation, local and metadata names and
@@ -1163,6 +1212,9 @@ pub(super) fn detect_module_requirements_in_llvm_text(contents: &str) -> ModuleR
         || contains_multimem_features(contents)
         || contains_redux_f32_features(contents)
         || contains_f32x2_features(contents)
+        // `.b128` and `q` operands need PTX 8.3, which has no spelling of its
+        // own; round up to the nearest supported one, as the TMA 8.3 floors do.
+        || contains_b128_features(contents)
     {
         ptx_isa = ptx_isa.max(PtxIsaRequirement::new(86));
     }
