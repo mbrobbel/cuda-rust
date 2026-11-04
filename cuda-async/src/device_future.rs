@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Future type that bridges CUDA stream callbacks with Rust's async executor.
+//! Future type that bridges CUDA stream completion with Rust's async executor.
 //!
 //! [`DeviceFuture`] drives a [`DeviceOp`] through a small state machine:
 //!
@@ -39,19 +39,19 @@ pub enum DeviceFutureState {
     // The future was created with an error and will resolve immediately on first poll.
     /// The future was created with an error and will resolve immediately.
     Failed,
-    // The stream operation has not yet been scheduled. No callback has been added.
+    // The stream operation has not yet been scheduled. No completion signal is registered.
     /// The stream operation has not yet been scheduled.
     Idle,
-    // The stream operation has been scheduled and a callback has been added to the stream.
-    // The callback should be added such that it immediately succeeds the scheduled operation.
-    /// The stream operation is in-flight and a completion callback is registered.
+    // The stream operation has been scheduled and a completion signal (reactor flag
+    // write or host callback) has been enqueued immediately after it.
+    /// The stream operation is in-flight and a completion signal is registered.
     Executing,
-    // The callback has been fired, indicating the completion of the stream operation.
-    /// The stream callback has fired, indicating the operation is done.
+    // The operation has finished or failed, and its result has been handed out.
+    /// The operation has finished (or failed); the result has been handed out.
     Complete,
 }
 
-/// Shared state between a CUDA stream callback and the async waker.
+/// Shared state between a completion signal (reactor or host callback) and the async waker.
 #[derive(Debug, Default)]
 pub struct StreamCallbackState {
     pub(crate) waker: AtomicWaker,
@@ -59,7 +59,7 @@ pub struct StreamCallbackState {
 }
 
 impl StreamCallbackState {
-    /// Creates a new callback state with the completion flag unset.
+    /// Creates a new completion state with the completion flag unset.
     pub fn new() -> Self {
         Self::default()
     }
@@ -184,10 +184,12 @@ impl<T: Send, DO: DeviceOp<Output = T>> DeviceFuture<T, DO> {
         }
     }
 
-    /// Registers a host callback on the CUDA stream to signal completion.
+    /// Registers a completion signal on the CUDA stream: the flag-write
+    /// reactor, or a host callback when the reactor is unavailable or
+    /// `CUDA_ASYNC_HOST_SYNC` selects it.
     ///
     /// # Safety
-    /// The execution context's stream must be valid for the lifetime of the callback.
+    /// The execution context's stream must remain valid until the completion signal fires.
     unsafe fn register_callback(
         &self,
         waker_state: Arc<StreamCallbackState>,
@@ -393,7 +395,7 @@ impl<T: Send, DO: DeviceOp<Output = T>> Future for DeviceFuture<T, DO> {
             }
             DeviceFutureState::Executing => {
                 // The future may have been polled by the waker firing or by some other mechanism.
-                // Check if the complete flag has been set by the callback.
+                // Check if the complete flag has been set by the completion signal.
                 if waker_state.complete.load(Ordering::Acquire) {
                     self.state = DeviceFutureState::Complete;
                     // If the future was polled by some mechanism other than the waker,
@@ -431,8 +433,8 @@ impl<T: Send, DO: DeviceOp<Output = T>> Future for DeviceFuture<T, DO> {
                 }
                 // The future is still incomplete. Update the waker to the latest context.
                 waker_state.waker.register(cx.waker());
-                // Check if the callback has fired after updating the waker.
-                // If the callback triggers the old waker before the new waker is registered,
+                // Check if the completion signal has fired after updating the waker.
+                // If the signal triggers the old waker before the new waker is registered,
                 // the newly registered waker will never be called.
                 if waker_state.complete.load(Ordering::Acquire) {
                     self.state = DeviceFutureState::Complete;

@@ -258,7 +258,7 @@ impl ExecutionContext {
         unsafe {
             // Safety: ExecutionContext is only available within a DeviceOp closure.
             // DeviceOp closures can only be converted into DeviceFuture
-            // which synchronizes device operations with the host thread via a host callback.
+            // which synchronizes device operations with the host via a completion check or signal.
             op.execute(self)
         }
     }
