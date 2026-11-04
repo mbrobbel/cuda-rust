@@ -2120,6 +2120,110 @@ mod tests {
         assert_eq!(count_ops::<llvm::ZExtOp>(&ctx, &body), 0);
     }
 
+    /// `Option<i128>` has no niche, so rustc widens its Direct tag to the
+    /// payload's 16-byte alignment: a 128-bit carrier at byte 0 with the
+    /// payload at byte 16. Construction must write the whole i128 tag (a
+    /// narrower store would leave tag bytes undefined), and a discriminant
+    /// read must extract that i128 slot before MIR's cast narrows it.
+    #[test]
+    fn direct_128_bit_tag_constructs_and_reads_an_i128_carrier() {
+        let mut ctx = make_ctx();
+        let tag_ty: TypeHandle = IntegerType::get(&ctx, 128, Signedness::Unsigned).into();
+        let payload_ty: TypeHandle = IntegerType::get(&ctx, 128, Signedness::Signed).into();
+        let isize_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signed).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_layout(
+            &mut ctx,
+            "Option".into(),
+            tag_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new_with_layout("Some".into(), vec![payload_ty], vec![16], vec![16]),
+            ],
+            0,
+            32,
+            16,
+        )
+        .into();
+        let slot_map = build_enum_slot_map(&mut ctx, enum_ty).unwrap();
+        assert_eq!(slot_map.carrier_slot, Some(0));
+        assert_eq!(slot_map.field_slots, vec![Some(1)]);
+
+        let (module, block) = build_kernel(&mut ctx, vec![payload_ty], vec![isize_ty]);
+        let payload = block.deref(&ctx).get_argument(0);
+        let construct = Operation::new(
+            &mut ctx,
+            mir::MirConstructEnumOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![payload],
+            vec![],
+            0,
+        );
+        mir::MirConstructEnumOp::new(construct)
+            .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(1));
+        construct.insert_at_back(block, &ctx);
+        let enum_value = construct.deref(&ctx).get_result(0);
+        let get = Operation::new(
+            &mut ctx,
+            mir::MirGetDiscriminantOp::get_concrete_op_info(),
+            vec![tag_ty],
+            vec![enum_value],
+            vec![],
+            0,
+        );
+        get.insert_at_back(block, &ctx);
+        let discriminant = get.deref(&ctx).get_result(0);
+        let cast = Operation::new(
+            &mut ctx,
+            mir::MirCastOp::get_concrete_op_info(),
+            vec![isize_ty],
+            vec![discriminant],
+            vec![],
+            0,
+        );
+        mir::MirCastOp::new(cast).set_attr_cast_kind(&ctx, MirCastKindAttr::IntToInt);
+        cast.insert_at_back(block, &ctx);
+        let narrowed = cast.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![narrowed]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        let body = kernel_blocks(&ctx, module);
+        let tag_constants: Vec<(u32, u64)> = find_all::<llvm::ConstantOp>(&ctx, &body)
+            .iter()
+            .filter_map(|constant| {
+                let attr = constant.get_value(&ctx);
+                (&*attr as &dyn pliron::attribute::Attribute)
+                    .downcast_ref::<IntegerAttr>()
+                    .map(|value| (value.value().bw() as u32, value.value().to_u64()))
+            })
+            .collect();
+        assert!(
+            tag_constants.contains(&(128, 1)),
+            "Some must store its declared discriminant as a full i128 tag: {tag_constants:?}"
+        );
+        let mut inserted = insert_indices(&ctx, &find_all::<llvm::InsertValueOp>(&ctx, &body));
+        inserted.sort();
+        assert_eq!(
+            inserted,
+            vec![vec![0], vec![1]],
+            "construction writes the i128 tag slot and the i128 payload slot"
+        );
+        let extracted: Vec<Vec<u32>> = find_all::<llvm::ExtractValueOp>(&ctx, &body)
+            .iter()
+            .map(|extract| extract.indices(&ctx))
+            .collect();
+        assert_eq!(
+            extracted,
+            vec![vec![0]],
+            "the discriminant read extracts the i128 carrier slot"
+        );
+        assert_eq!(
+            count_ops::<llvm::TruncOp>(&ctx, &body),
+            1,
+            "MIR's IntToInt cast narrows the 128-bit discriminant to isize"
+        );
+    }
+
     #[test]
     fn single_layout_preserves_large_and_negative_declared_discriminants() {
         for (width, signedness, bits, widened_width, expects_sext) in [

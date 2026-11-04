@@ -506,9 +506,10 @@ fn translate_assert(
 /// keeps its whole value. Narrower widths truncate, which is what the
 /// discriminant's own type already did to the value.
 ///
-/// Enum tags cannot reach here above 64 bits. `translate_adt_type` rejects a
-/// discriminant carrier wider than that when it builds the enum type, so the
-/// widths above 64 that arrive here belong to integer scrutinees.
+/// A `#[repr(u128)]`/`#[repr(i128)]` enum's discriminant can arrive here at
+/// 128 bits too. `translate_adt_type` only admits such an enum when every
+/// declared value fits in 64 bits, and the arm values here are built at the
+/// full width either way.
 fn switch_arm_constant(
     ctx: &mut Context,
     val: u128,

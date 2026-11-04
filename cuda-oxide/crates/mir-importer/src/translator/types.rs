@@ -1077,9 +1077,14 @@ pub fn translate_type(
                     // u128, so Direct, Single, and all-uninhabited Empty
                     // layouts must mask them to the width rustc actually
                     // uses. Empty may still have source variants; it merely
-                    // has no valid physical value. The dialect currently
-                    // stores discriminants in u64, so reject wider forms
-                    // explicitly rather than silently aliasing them (#306).
+                    // has no valid physical value. The dialect stores the
+                    // masked values as u64 and lowering zero-extends them
+                    // to the carrier, so a tag may be up to 128 bits wide
+                    // (rustc widens `Option<i128>`'s tag to the payload's
+                    // alignment) as long as every masked value fits in 64
+                    // bits. A value that does not (`#[repr(u128)]` with
+                    // `A = 1 << 64`, or a negative `#[repr(i128)]`) is
+                    // rejected rather than silently truncated.
                     let logical_width = discriminant_ty
                         .deref(ctx)
                         .downcast_ref::<pliron::builtin::types::IntegerType>()
@@ -1113,18 +1118,24 @@ pub fn translate_type(
                                     } else {
                                         logical_width
                                     };
-                                if width > 64 {
+                                if width > 128 {
                                     return input_err_noloc!(TranslationErr::unsupported(format!(
-                                        "Enum {} uses a {}-bit discriminant; widths above 64 bits are not yet represented losslessly (issue #306)",
+                                        "Enum {} uses a {}-bit discriminant; widths above 128 bits are not supported",
                                         enum_name, width
                                     )));
                                 }
-                                let mask = if width == 64 {
-                                    u128::from(u64::MAX)
+                                let mask = if width == 128 {
+                                    u128::MAX
                                 } else {
                                     (1u128 << width) - 1
                                 };
-                                (discr.val & mask) as u64
+                                let bits = discr.val & mask;
+                                u64::try_from(bits).map_err(|_| {
+                                    input_error_noloc!(TranslationErr::unsupported(format!(
+                                        "Enum {} variant {} has a {}-bit discriminant value {:#x} that does not fit in 64 bits",
+                                        enum_name, idx, width, bits
+                                    )))
+                                })?
                             }
                             _ => unreachable!("importer always records a known enum layout"),
                         };

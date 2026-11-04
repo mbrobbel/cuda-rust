@@ -17,6 +17,7 @@ Run `cuda-oxide/scripts/check-error-example-status.sh` to verify both are in syn
 | `error_enum_bool_payload_addr`         | diagnostics-fixture | `&mut` to a canonical-byte payload   |
 | `error_enum_pointer_overlap`           | support-gap         | Overlaid pointer/integer payload     |
 | `error_enum_shared_pointer_layout`     | support-gap         | Oversized AS3 pointer arrays/vectors |
+| `error_enum_wide_discriminant`         | support-gap         | Discriminant value above 64 bits     |
 | `error_generated_intrinsic_abi`        | diagnostics-fixture | Unsupported raw intrinsic ABI        |
 | `error_generated_intrinsic_callable`   | diagnostics-fixture | Raw intrinsic passed through `Fn`    |
 | `error_generated_intrinsic_fn_pointer` | diagnostics-fixture | Raw intrinsic made into `fn` pointer |

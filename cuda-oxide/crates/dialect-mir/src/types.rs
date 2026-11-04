@@ -1263,7 +1263,10 @@ pub struct MirEnumType {
     pub variant_names: Vec<String>,
     /// Declared discriminant VALUES in variant order, as the unsigned bit
     /// pattern at tag width (e.g. `Ordering::Less` = -1 is stored as 255
-    /// for an i8 tag). These are values, not variant indices.
+    /// for an i8 tag). These are values, not variant indices. A tag wider
+    /// than 64 bits (rustc widens `Option<i128>`'s to 128) zero-extends
+    /// these values; the importer rejects a value that needs more than 64
+    /// bits instead of truncating it.
     pub variant_discriminants: Vec<u64>,
     /// Number of fields for each variant (parallel to variant_names)
     pub variant_field_counts: Vec<u32>,
@@ -1733,11 +1736,11 @@ impl Verify for MirEnumType {
             EnumLayoutKind::Direct => {
                 if self.carrier_kind != EnumCarrierKind::Integer
                     || self.carrier_width == 0
-                    || self.carrier_width > 64
+                    || self.carrier_width > 128
                 {
                     return verify_err!(
                         Location::Unknown,
-                        "MirEnumType direct layout requires a 1..=64-bit integer carrier because declared discriminants are stored as u64"
+                        "MirEnumType direct layout requires a 1..=128-bit integer carrier"
                     );
                 }
                 if logical_width != self.carrier_width {
@@ -2293,6 +2296,43 @@ mod enum_layout_tests {
         );
     }
 
+    /// `Option<i128>` and `Result<i128, u128>` have no niche, so rustc gives
+    /// them a Direct tag widened to the payload's 16-byte alignment: a
+    /// 128-bit carrier whose declared discriminants still fit in a `u64`.
+    #[test]
+    fn direct_layout_accepts_rustc_widened_128_bit_tag() {
+        let ctx = Context::new();
+        let payload: TypeHandle = IntegerType::get(&ctx, 128, Signedness::Signed).into();
+
+        let mut option_i128 = direct(&ctx);
+        option_i128.name = "Option".into();
+        option_i128.discriminant_ty = IntegerType::get(&ctx, 128, Signedness::Unsigned).into();
+        option_i128.variant_names = vec!["None".into(), "Some".into()];
+        option_i128.variant_discriminants = vec![0, 1];
+        option_i128.variant_field_counts = vec![0, 1];
+        option_i128.all_field_types = vec![payload];
+        option_i128.all_field_offsets = vec![16];
+        option_i128.all_field_sizes = vec![16];
+        option_i128.carrier_width = 128;
+        option_i128.total_size = 32;
+        option_i128.abi_align = 16;
+        assert!(
+            option_i128.verify(&ctx).is_ok(),
+            "a 128-bit Direct carrier holds zero-extended u64 discriminants"
+        );
+
+        let mut repr_u128 = direct(&ctx);
+        repr_u128.discriminant_ty = IntegerType::get(&ctx, 128, Signedness::Unsigned).into();
+        repr_u128.variant_discriminants = vec![0, u64::MAX];
+        repr_u128.carrier_width = 128;
+        repr_u128.total_size = 16;
+        repr_u128.abi_align = 16;
+        assert!(
+            repr_u128.verify(&ctx).is_ok(),
+            "every u64 value is a valid 128-bit discriminant"
+        );
+    }
+
     #[test]
     fn malformed_physical_metadata_is_rejected() {
         let ctx = Context::new();
@@ -2318,12 +2358,15 @@ mod enum_layout_tests {
         zst_without_alignment.abi_align = 0;
         assert!(zst_without_alignment.verify(&ctx).is_err());
 
-        let mut wide_direct = direct(&ctx);
-        wide_direct.discriminant_ty = IntegerType::get(&ctx, 128, Signedness::Unsigned).into();
-        wide_direct.carrier_width = 128;
-        wide_direct.total_size = 16;
-        wide_direct.abi_align = 16;
-        assert!(wide_direct.verify(&ctx).is_err());
+        let mut over_wide_direct = direct(&ctx);
+        over_wide_direct.discriminant_ty = IntegerType::get(&ctx, 256, Signedness::Unsigned).into();
+        over_wide_direct.carrier_width = 256;
+        over_wide_direct.total_size = 32;
+        over_wide_direct.abi_align = 16;
+        assert!(
+            over_wide_direct.verify(&ctx).is_err(),
+            "no rustc tag is wider than 128 bits"
+        );
 
         let mut partial_byte_direct = direct(&ctx);
         partial_byte_direct.discriminant_ty =

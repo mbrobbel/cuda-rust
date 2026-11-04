@@ -2584,6 +2584,46 @@ mod tests {
         );
     }
 
+    /// `Option<i128>` / `Result<i128, u128>`: no niche, so rustc widens the
+    /// Direct tag to the payload's 16-byte alignment. The slot map must give
+    /// the whole 16-byte tag one i128 carrier slot at byte 0, ahead of the
+    /// i128 payload at byte 16, so a tag write defines every tag byte.
+    #[test]
+    fn enum_slot_map_gives_widened_128_bit_direct_tag_one_i128_slot() {
+        let mut ctx = make_ctx();
+        let tag = mir_uint(&mut ctx, 128);
+        let payload: TypeHandle = IntegerType::get(&ctx, 128, Signedness::Signed).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_layout(
+            &mut ctx,
+            "Option".into(),
+            tag,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new_with_layout("Some".into(), vec![payload], vec![16], vec![16]),
+            ],
+            0,
+            32,
+            16,
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty).unwrap();
+        let i128_ty = llvm_int(&mut ctx, 128);
+        assert_eq!(map.carrier_slot, Some(0));
+        assert_eq!(map.carrier_llvm_ty, Some(i128_ty));
+        assert_eq!(map.field_slots, vec![Some(1)]);
+        assert_eq!(
+            struct_fields(&ctx, map.llvm_struct_ty),
+            vec![i128_ty, i128_ty]
+        );
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((32, 16)),
+            "the widened tag must keep rustc's 32-byte size and 16-byte alignment"
+        );
+    }
+
     /// `(element count, element width in bits)` of an array-typed filler.
     fn filler_array(ctx: &Context, filler: TypeHandle) -> (u64, u32) {
         let filler_ref = filler.deref(ctx);
