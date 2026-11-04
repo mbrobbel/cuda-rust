@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   misaligned Rust slices; sizes exceeding Rust's slice limits are rejected.
 - `DeviceBuffer::zeroed` waits for initialization to finish before returning,
   so another stream cannot read uninitialized element representations.
+- Dropping a stream-ordered `DeviceBuffer` while its allocation stream is
+  being captured no longer leaks it or fails the capture with an invalid-value
+  error: buffers allocated before the capture are freed once it ends, and
+  buffers allocated inside it are freed by the captured graph. Resource
+  retirement no longer invalidates another thread's global-mode capture.
 - Atomic buffer conversions use `DeviceRepr` instead of `TransparentWrapper`,
   preserving owned-buffer conversions without permitting invalid shared-reference
   conversions between atomics and their scalar representations.

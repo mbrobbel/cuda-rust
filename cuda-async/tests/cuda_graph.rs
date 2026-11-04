@@ -7,8 +7,9 @@
 //! and `update`.
 
 use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_box::DeviceBox;
 use cuda_async::device_future::DeviceFuture;
-use cuda_async::device_operation::{value, DeviceOp, ExecutionContext, Value};
+use cuda_async::device_operation::{value, with_context, DeviceOp, ExecutionContext, Value};
 use cuda_async::error::DeviceError;
 use std::future::IntoFuture;
 
@@ -371,5 +372,84 @@ fn update_runs_unit_graph_nodes() {
             })
             .sync_on(&stream);
         assert!(nested.is_ok());
+    });
+}
+
+/// Dropping a buffer allocated on the captured stream inside the scope must
+/// neither fail the capture nor leak the allocation: its stream-ordered free is
+/// deferred until the capture has ended.
+#[test]
+fn scope_drop_of_buffer_allocated_on_captured_stream() {
+    if !has_gpu() {
+        return;
+    }
+    on_fresh_thread(|| {
+        let device = cuda_core::Context::new(0).unwrap();
+        let stream = device.new_stream().unwrap();
+        let buffer =
+            unsafe { cuda_core::DeviceBuffer::<u8>::uninitialized_async(&stream, 1 << 18) }
+                .unwrap();
+        stream.synchronize().unwrap();
+        let ptr = buffer.cu_deviceptr();
+
+        let graph = CudaGraph::scope(&stream, |_s| {
+            drop(buffer);
+            // Give the retirement worker time to reach the allocation.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        });
+        assert!(graph.is_ok(), "scope failed: {:?}", graph.err());
+        graph.unwrap().launch().sync_on(&stream).unwrap();
+
+        device.bind_to_thread().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let freed = loop {
+            let (mut base, mut size) = (0, 0);
+            let status =
+                unsafe { cuda_core::sys::cuMemGetAddressRange_v2(&mut base, &mut size, ptr) };
+            if status == cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_FOUND {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(freed, "allocation was not freed after the capture ended");
+    });
+}
+
+/// A temporary allocated and dropped inside a captured operation is a graph
+/// allocation: its stream-ordered free must join the capture so the capture
+/// succeeds and the graph can be launched repeatedly.
+#[test]
+fn capture_frees_temporary_allocated_inside_the_capture() {
+    if !has_gpu() {
+        return;
+    }
+    on_fresh_thread(|| {
+        let device = cuda_core::Context::new(0).unwrap();
+        let stream = device.new_stream().unwrap();
+        let graph = CudaGraph::capture(
+            stream.clone(),
+            with_context(|ctx| {
+                let ptr = unsafe { ctx.alloc_async(1 << 18) }.unwrap();
+                let temporary = unsafe {
+                    DeviceBox::<[u8]>::from_raw_parts(ptr, 1 << 18, ctx.get_cuda_stream().clone())
+                };
+                drop(temporary);
+                // Give the retirement worker time to reach the allocation while
+                // the capture is still open.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                value(())
+            }),
+        );
+        assert!(graph.is_ok(), "capture failed: {:?}", graph.err());
+        let graph = graph.unwrap();
+        for launch in 0..3 {
+            let result = graph.launch().sync_on(&stream);
+            assert!(result.is_ok(), "launch {launch} failed: {:?}", result.err());
+        }
+        assert_eq!(device.check_err(), Ok(()));
     });
 }

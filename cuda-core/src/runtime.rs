@@ -289,6 +289,14 @@ impl Context {
     /// Binds this context to the calling thread if not already current.
     pub fn bind_to_thread(&self) -> Result<(), DriverError> {
         self.check_err()?;
+        self.make_current()
+    }
+
+    /// Makes this context current on the calling thread if it is not already.
+    ///
+    /// Unlike [`bind_to_thread`](Self::bind_to_thread), this leaves the sticky
+    /// error untouched, so internal polling cannot consume an error meant for the user.
+    pub(crate) fn make_current(&self) -> Result<(), DriverError> {
         if match ctx::get_current()? {
             Some(curr_ctx) => curr_ctx != self.cu_ctx,
             None => true,

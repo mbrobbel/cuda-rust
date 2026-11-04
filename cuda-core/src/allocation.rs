@@ -98,31 +98,128 @@ impl Drop for Allocation {
         }
         let ptr = self.ptr;
         let context = self.context.clone();
-        let allocation_stream = match &self.owner {
-            Owner::StreamOrdered(s) => Some(s.clone()),
-            _ => None,
-        };
         // All safe users hold an independent access lease until completion.
         // Driver teardown is retired on a worker, never on the dropping thread.
+        if let Owner::StreamOrdered(stream) = &self.owner {
+            retire_stream_ordered(ptr, context, stream.clone());
+            return;
+        }
         crate::completion::defer(move || {
             if let Err(error) = context.bind_to_thread() {
                 context.record_err(Err::<(), _>(error));
-                std::mem::forget((context, allocation_stream));
+                std::mem::forget(context);
                 return;
             }
-            let result = if let Some(stream) = &allocation_stream {
-                // SAFETY: the allocation is no longer accessed and the retained
-                // stream is the one on which its allocation became valid.
-                unsafe { crate::memory::free_async(ptr, stream.cu_stream()) }
-            } else {
-                // SAFETY: ownership of this synchronous allocation is unique.
-                unsafe { crate::memory::free_sync(ptr) }
-            };
-            if let Err(error) = result {
+            // SAFETY: ownership of this synchronous allocation is unique.
+            if let Err(error) = unsafe { crate::memory::free_sync(ptr) } {
                 context.record_err(Err::<(), _>(error));
-                std::mem::forget((context, allocation_stream));
+                std::mem::forget(context);
             }
         });
+    }
+}
+
+/// Schedules the free of a stream-ordered allocation on the retirement worker.
+///
+/// The dropping thread never touches the driver; the worker runs
+/// [`free_stream_ordered`] once all earlier retirements have been queued.
+fn retire_stream_ordered(ptr: CUdeviceptr, context: Arc<Context>, stream: Arc<Stream>) {
+    crate::completion::defer(move || free_stream_ordered(ptr, context, stream));
+}
+
+/// Frees a stream-ordered allocation on its allocation stream.
+///
+/// The free is enqueued even while that stream captures: an allocation made
+/// inside the same capture is a graph allocation, and its free must join the
+/// capture as a graph free node so the graph stays relaunchable. A capturing
+/// stream rejects the free of memory the graph did not allocate without
+/// disturbing the capture; that free waits for the capture to end instead of
+/// leaking. Any other failure records the error and leaks the allocation.
+fn free_stream_ordered(ptr: CUdeviceptr, context: Arc<Context>, stream: Arc<Stream>) {
+    if let Err(error) = context.bind_to_thread() {
+        context.record_err(Err::<(), _>(error));
+        std::mem::forget((context, stream));
+        return;
+    }
+    match capture_state(&context, &stream) {
+        Ok(CaptureState::Idle | CaptureState::Capturing) => {}
+        Ok(CaptureState::Blocked) => return free_after_capture(ptr, context, stream),
+        Err(error) => {
+            context.record_err(Err::<(), _>(error));
+            std::mem::forget((context, stream));
+            return;
+        }
+    }
+    // SAFETY: the allocation is no longer accessed and the retained stream is
+    // the one on which its allocation became valid.
+    match unsafe { crate::memory::free_async(ptr, stream.cu_stream()) } {
+        Ok(()) => {}
+        Err(_)
+            if matches!(
+                capture_state(&context, &stream),
+                Ok(CaptureState::Capturing | CaptureState::Blocked)
+            ) =>
+        {
+            free_after_capture(ptr, context, stream);
+        }
+        Err(error) => {
+            context.record_err(Err::<(), _>(error));
+            std::mem::forget((context, stream));
+        }
+    }
+}
+
+/// Retries [`free_stream_ordered`] once `stream` is no longer capturing.
+///
+/// The worker polls roughly once per millisecond, so a stream that is captured
+/// again back to back without such a gap keeps the free pending (never lost).
+/// A failed readiness check records the error and leaks the allocation.
+fn free_after_capture(ptr: CUdeviceptr, context: Arc<Context>, stream: Arc<Stream>) {
+    let ready_context = context.clone();
+    let ready_stream = stream.clone();
+    crate::completion::defer_until(
+        move || {
+            capture_state(&ready_context, &ready_stream)
+                .map(|state| state == CaptureState::Idle)
+                .inspect_err(|error| ready_context.record_err(Err::<(), _>(*error)))
+        },
+        move || free_stream_ordered(ptr, context, stream),
+    );
+}
+
+/// Capture state of an allocation stream, as it matters for freeing on it.
+///
+/// Derived from `cuStreamIsCapturing`; see [`capture_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureState {
+    /// Not capturing: a free runs as ordinary stream work.
+    Idle,
+    /// Actively capturing: a free joins the capture if the graph owns the memory.
+    Capturing,
+    /// The capture was invalidated, or this legacy stream would implicitly
+    /// depend on a capturing blocking stream: no free may be enqueued yet.
+    Blocked,
+}
+
+/// Queries the [`CaptureState`] of `stream` without enqueueing any work.
+///
+/// The context is made current first because the legacy stream resolves
+/// through it; the sticky error is left for the user.
+fn capture_state(context: &Context, stream: &Stream) -> Result<CaptureState, DriverError> {
+    context.make_current()?;
+    // SAFETY: `stream` is a live stream retained by the allocation owner.
+    match unsafe { crate::cudarc_shim::stream::is_capturing(stream.cu_stream()) } {
+        Ok(cuda_bindings::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE) => {
+            Ok(CaptureState::Idle)
+        }
+        Ok(cuda_bindings::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_ACTIVE) => {
+            Ok(CaptureState::Capturing)
+        }
+        Ok(_) => Ok(CaptureState::Blocked),
+        Err(DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_IMPLICIT)) => {
+            Ok(CaptureState::Blocked)
+        }
+        Err(error) => Err(error),
     }
 }
 
