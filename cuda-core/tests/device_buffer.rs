@@ -426,6 +426,138 @@ fn drop_async_bind_error_preserves_ordinary_cleanup() {
     }
 }
 
+/// Waits up to five seconds for the driver to stop recognizing `ptr` as an
+/// allocation, i.e. for its deferred free to have run on the retirement
+/// worker. Probes with a raw driver call, which leaves the context's error
+/// slot alone; panics if the driver reports anything but a live or freed
+/// address.
+fn wait_until_freed(ptr: cuda_bindings::CUdeviceptr) -> bool {
+    let mut base = 0;
+    let mut size = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: both out-pointers are valid for writes, and the driver only
+        // looks `ptr` up; it is never dereferenced.
+        let status = unsafe { cuda_bindings::cuMemGetAddressRange_v2(&mut base, &mut size, ptr) };
+        if status == cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_FOUND {
+            return true;
+        }
+        assert_eq!(status, cuda_bindings::cudaError_enum_CUDA_SUCCESS);
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// An unrelated error pending in the context's error slot while a tracked
+/// write is in flight must not stop completion-bound retirement: the lease is
+/// still released once the write completes, so the dropped buffer is freed,
+/// and the error stays pending for the caller instead of being consumed.
+#[test]
+fn pending_context_error_does_not_leak_retired_lease() {
+    let _gated_test_guard = lock_gated_test();
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+    let mut dev =
+        DeviceBuffer::<u8>::zeroed(&stream, 4096).expect("failed to allocate device buffer");
+    let ptr = dev.cu_deviceptr();
+
+    // Hold the tracked write behind a host-function gate, so its lease is
+    // still waiting for completion when the unrelated error is recorded.
+    let release_gate = gate_stream(&stream);
+    dev.zero_async(&stream)
+        .expect("failed to enqueue tracked write");
+    let injected = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+    ctx.record_err::<()>(Err(injected));
+    drop(dev);
+    release_gate
+        .send(())
+        .expect("failed to release stream gate");
+
+    // The allocation is freed only after its lease retires.
+    let reclaimed = wait_until_freed(ptr);
+    let pending = ctx.check_err();
+    assert!(
+        reclaimed,
+        "an unrelated pending context error leaked the retired lease and its allocation \
+         (pending error afterwards: {pending:?})"
+    );
+    assert_eq!(
+        pending,
+        Err(injected),
+        "completion-bound retirement consumed an unrelated pending context error"
+    );
+}
+
+/// A stream-ordered allocation keeps its allocation stream alive for the
+/// deferred free. When the caller has already dropped their own handle, that
+/// clone is the last one, so `Stream::drop` runs on the retirement worker on
+/// the caller's behalf. With an unrelated error pending in the context's
+/// error slot, the free and the stream's own teardown must both go ahead, and
+/// the error must still be pending for the caller afterwards.
+#[test]
+fn pending_context_error_survives_last_stream_drop_on_retirement_worker() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+    // SAFETY: zeroed below before anything reads it.
+    let mut dev = unsafe { DeviceBuffer::<u8>::uninitialized_async(&stream, 4096) }
+        .expect("failed to allocate stream-ordered device buffer");
+    dev.zero_async(&stream)
+        .expect("failed to enqueue tracked write");
+    stream.synchronize().expect("failed to synchronize stream");
+    let ptr = dev.cu_deviceptr();
+
+    // Give up the caller's handle: the allocation's clone is now the last.
+    let stream_alive = Arc::downgrade(&stream);
+    drop(stream);
+    assert!(
+        stream_alive.upgrade().is_some(),
+        "the stream-ordered allocation must retain its stream"
+    );
+
+    let injected = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+    ctx.record_err::<()>(Err(injected));
+    drop(dev);
+
+    let reclaimed = wait_until_freed(ptr);
+    // The worker drops the stream right after the free; wait for that too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stream_alive.strong_count() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let stream_dropped = stream_alive.strong_count() == 0;
+    let pending = ctx.check_err();
+    assert!(
+        reclaimed && stream_dropped,
+        "an unrelated pending context error leaked the allocation or its stream \
+         (freed: {reclaimed}, stream dropped: {stream_dropped}, pending error: {pending:?})"
+    );
+    assert_eq!(
+        pending,
+        Err(injected),
+        "dropping the last stream handle on the retirement worker consumed an unrelated \
+         pending context error"
+    );
+}
+
+/// Dropping the caller's last stream handle with an unrelated error pending
+/// in the context's error slot leaves that error pending.
+#[test]
+fn stream_drop_preserves_pending_context_error() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+    stream.synchronize().expect("failed to synchronize stream");
+    let injected = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+    ctx.record_err::<()>(Err(injected));
+    drop(stream);
+    assert_eq!(
+        ctx.check_err(),
+        Err(injected),
+        "dropping a stream consumed an unrelated pending context error"
+    );
+}
+
 #[test]
 fn from_host_with_pinned_source_allows_source_drop_after_return() {
     let ctx = CudaContext::new(0).expect("failed to create CUDA context");

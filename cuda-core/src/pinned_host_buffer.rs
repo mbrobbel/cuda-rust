@@ -160,7 +160,9 @@ impl<T: DeviceCopy> PinnedHostBuffer<T> {
 impl<T: DeviceCopy> Drop for PinnedHostBuffer<T> {
     fn drop(&mut self) {
         if let Some(allocation) = self.allocation {
-            self.ctx.record_err(self.ctx.bind_to_thread());
+            // `make_current` leaves an error already pending in the slot in
+            // place, instead of taking it and storing it back.
+            self.ctx.record_err(self.ctx.make_current());
             self.ctx
                 .record_err(unsafe { crate::memory::free_host(allocation.as_ptr().cast()) });
         }

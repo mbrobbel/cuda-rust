@@ -19,8 +19,18 @@ impl Stream {
     /// and any stream from [`Context::new_stream`](crate::context::Context::new_stream)
     /// report `0`.
     pub fn priority(&self) -> Result<i32, DriverError> {
-        self.context.bind_to_thread()?;
+        self.context.check_err()?;
+        self.priority_preserving_err()
+    }
+    /// [`priority`](Self::priority) without reading or clearing the error
+    /// recorded by [`Context::record_err`](crate::Context::record_err).
+    ///
+    /// For `Stream::drop`, which must not consume an unrelated pending error.
+    pub(crate) fn priority_preserving_err(&self) -> Result<i32, DriverError> {
+        self.context.make_current()?;
         let mut priority = MaybeUninit::uninit();
+        // SAFETY: the handle is valid (RAII wrapper), its context is current,
+        // and `priority` is initialized whenever the driver reports success.
         unsafe {
             cuda_bindings::cuStreamGetPriority(self.cu_stream, priority.as_mut_ptr()).result()?;
             Ok(priority.assume_init())

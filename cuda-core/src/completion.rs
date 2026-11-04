@@ -35,7 +35,7 @@ fn enqueue(pending: Pending) {
                         let ready = pending[i]
                             .event
                             .as_ref()
-                            .map_or(Ok(true), |event| event.query());
+                            .map_or(Ok(true), |event| event.query_preserving_err());
                         match ready {
                             Ok(false) => i += 1,
                             Ok(true) => {
@@ -81,11 +81,14 @@ pub(crate) fn defer(cleanup: impl FnOnce() + Send + 'static) {
 ///
 /// Failure to record or observe completion intentionally leaks the owner;
 /// releasing it could invalidate work that the driver has already accepted.
+/// An unrelated error pending in the context's error slot (see
+/// [`Context::record_err`](crate::Context::record_err)) is not such a failure:
+/// it is neither observed nor consumed here.
 pub fn retain_until_complete(
     owner: impl Send + 'static,
     stream: &Stream,
 ) -> Result<(), DriverError> {
-    let event = match stream.record_event(None) {
+    let event = match record_preserving_err(stream) {
         Ok(event) => event,
         Err(error) => {
             std::mem::forget(owner);
@@ -97,6 +100,27 @@ pub fn retain_until_complete(
         cleanup: Box::new(move || drop(owner)),
     });
     Ok(())
+}
+
+/// Records a timing-free completion event on `stream`.
+///
+/// Unlike [`Stream::record_event`], this makes the context current without
+/// reading or clearing its error slot, so an unrelated pending error neither
+/// fails retirement (leaking the owner) nor is lost to its owner.
+pub(crate) fn record_preserving_err(stream: &Stream) -> Result<Event, DriverError> {
+    let context = stream.context();
+    context.make_current()?;
+    let cu_event = crate::cudarc_shim::event::create(
+        cuda_bindings::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING,
+    )?;
+    // Owning the handle from here on destroys it if the record below fails.
+    let event = Event {
+        cu_event,
+        context: context.clone(),
+    };
+    // SAFETY: the event was created on the stream's context, which is current.
+    unsafe { crate::cudarc_shim::event::record(event.cu_event, stream.cu_stream()) }?;
+    Ok(event)
 }
 
 pub(crate) fn retain_until_event(owner: impl Send + 'static, event: Arc<Event>) {

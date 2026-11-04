@@ -102,7 +102,9 @@ pub(crate) enum StreamHealth {
 ///
 /// Requires the stream's context to be current, or at least a context of
 /// the same process on the calling thread; callers on threads that never
-/// touched CUDA bind the device first.
+/// touched CUDA make the device current first. Never reads or clears the
+/// context's error slot (see `cuda_core::Context::record_err`): an error
+/// recorded there is not a fault of this stream.
 pub(crate) fn probe_stream(stream: &Stream) -> StreamHealth {
     let mut status = MaybeUninit::uninit();
     // SAFETY: the stream handle is valid (RAII wrapper) and `status` is a
@@ -117,11 +119,12 @@ pub(crate) fn probe_stream(stream: &Stream) -> StreamHealth {
     if status != cuda_bindings::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE {
         return StreamHealth::Capturing;
     }
-    // SAFETY: see above; not capturing, so a query is permitted.
-    match stream.query() {
-        Ok(true) => StreamHealth::Idle,
-        Ok(false) => StreamHealth::Busy,
-        Err(e) => StreamHealth::Faulted(e),
+    // SAFETY: see above; not capturing, so a query is permitted. Raw, because
+    // `Stream::query` binds through `bind_to_thread`, which takes the error slot.
+    match unsafe { cuda_bindings::cuStreamQuery(stream.cu_stream()) } {
+        cuda_bindings::cudaError_enum_CUDA_SUCCESS => StreamHealth::Idle,
+        cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_READY => StreamHealth::Busy,
+        code => StreamHealth::Faulted(DriverError(code)),
     }
 }
 
@@ -411,7 +414,8 @@ impl<T: Send, DO: DeviceOp<Output = T>> Future for DeviceFuture<T, DO> {
                     Some(ctx) => {
                         // The poll may run on an executor thread that never
                         // touched CUDA; the probe needs a current context.
-                        let _ = ctx.context().bind_to_thread();
+                        // Leave any pending error in the slot for its owner.
+                        let _ = ctx.context().make_current();
                         probe_stream(ctx.get_cuda_stream())
                     }
                     None => StreamHealth::Busy,

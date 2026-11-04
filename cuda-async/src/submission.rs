@@ -157,7 +157,10 @@ impl Drop for Submission {
             return;
         }
         let stream = self.stream.clone();
-        let health = match stream.context().bind_to_thread() {
+        // `make_current`, not `bind_to_thread`: an unrelated error pending in
+        // the context's error slot is not a fault of this stream. Taking it
+        // would leak every owner and lease below, and lose the error.
+        let health = match stream.context().make_current() {
             Ok(()) => probe_stream(&stream),
             Err(error) => StreamHealth::Faulted(error),
         };

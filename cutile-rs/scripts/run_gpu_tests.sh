@@ -272,6 +272,7 @@ for test_target in \
     drop_in_flight \
     execute_once \
     execution_lock \
+    pending_context_error \
     pool_allocation \
     reactor_correctness
 do

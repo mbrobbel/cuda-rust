@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Context::make_current` binds a context to the calling thread without
+  reading or clearing the error parked by `Context::record_err`, for cleanup
+  paths that must leave an unrelated pending error to its owner.
+
 ### Changed
 
 - Tile and SIMT share `cuda_async` operations, scheduling, futures and launch
@@ -19,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Drop and retirement paths in `cuda_core` and `cuda_async` no longer read or
+  clear an unrelated error pending in the context's error slot
+  (`Context::record_err`), so it stays pending for its owner. Dropping an
+  in-flight `DeviceFuture`, retiring an allocation lease or freeing a dropped
+  buffer no longer mistakes such an error for a fault and leaks owners, access
+  leases and memory (leaving the buffer write-excluded); only a real stream or
+  context fault still retains them. Dropping a `Stream`, `Module`, `MemPool` or
+  CUDA graph no longer consumes the error, including a stream whose last handle
+  drops on the retirement worker (such as the one a stream-ordered allocation
+  keeps for its deferred free), and dropping an `Event` or `PinnedHostBuffer`
+  no longer skips binding its context because of it.
 - CUDA bindings resolve forward-declared struct definitions correctly with
   libclang 22 instead of emitting an empty placeholder with the wrong layout.
 - Retiring tensor completion leases retain allocation access independently of

@@ -142,7 +142,9 @@ impl GraphExecHandle {
 
 impl Drop for GraphExecHandle {
     fn drop(&mut self) {
-        let _ = self.device.bind_to_thread();
+        // May run on the retirement worker; leave any pending error in the
+        // context's error slot to its owner.
+        let _ = self.device.make_current();
         if !self.cu_graph_exec.is_null() {
             let _ = unsafe { sys::cuGraphExecDestroy(self.cu_graph_exec).result() };
         }

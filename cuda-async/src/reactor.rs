@@ -215,8 +215,9 @@ fn probe_stale_slots(
 /// probe, and a capturing or merely busy stream is never dead. A retired
 /// slot's flag write can no longer land — the error is the context's sticky
 /// fault — so recycling the slot cannot be clobbered by a late device write.
+/// The scan never takes the context's error slot, which is not a stream fault.
 fn stream_is_faulted(stream: &Stream) -> bool {
-    if stream.context().bind_to_thread().is_err() {
+    if stream.context().make_current().is_err() {
         return false;
     }
     matches!(probe_stream(stream), StreamHealth::Faulted(_))

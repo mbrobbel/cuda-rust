@@ -48,9 +48,14 @@ impl Accesses {
     ) -> Result<u64, DriverError> {
         // A synchronous wait on another thread may have completed a retired
         // operation before the worker got to its lease. Do not report a stale
-        // conflict in that case. Errors leave the exclusion intact.
-        self.active
-            .retain(|a| !matches!(a.completion.as_ref().map(|e| e.query()), Some(Ok(true))));
+        // conflict in that case. Errors leave the exclusion intact. The query
+        // leaves an unrelated error pending in the context's slot in place.
+        self.active.retain(|a| {
+            !matches!(
+                a.completion.as_ref().map(|e| e.query_preserving_err()),
+                Some(Ok(true))
+            )
+        });
         if !recording
             && self
                 .active
@@ -105,7 +110,10 @@ impl Drop for Allocation {
         // All safe users hold an independent access lease until completion.
         // Driver teardown is retired on a worker, never on the dropping thread.
         crate::completion::defer(move || {
-            if let Err(error) = context.bind_to_thread() {
+            // `make_current`, not `bind_to_thread`: an unrelated error pending
+            // in the context's error slot must neither leak this allocation
+            // nor be consumed here.
+            if let Err(error) = context.make_current() {
                 context.record_err(Err::<(), _>(error));
                 std::mem::forget((context, allocation_stream));
                 return;
@@ -352,7 +360,7 @@ impl Drop for AllocationLease {
 impl AllocationLease {
     /// Transfers this lease to completion-bound retirement after submission.
     pub fn retain_until_complete(self, stream: &Stream) -> Result<(), DriverError> {
-        let event = match stream.record_event(None) {
+        let event = match crate::completion::record_preserving_err(stream) {
             Ok(event) => Arc::new(event),
             Err(error) => {
                 std::mem::forget(self);

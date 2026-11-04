@@ -143,7 +143,7 @@ impl Drop for Context {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&(self.cu_ctx as usize));
-        let _ = self.bind_to_thread();
+        let _ = self.make_current();
         let ctx = std::mem::replace(&mut self.cu_ctx, std::ptr::null_mut());
         if !ctx.is_null() {
             let _ = unsafe { primary_ctx::release(self.cu_device) };
@@ -287,8 +287,22 @@ impl Context {
     }
 
     /// Binds this context to the calling thread if not already current.
+    ///
+    /// First takes the error recorded by [`record_err`](Self::record_err), if
+    /// any, and returns it without binding (see [`check_err`](Self::check_err)).
     pub fn bind_to_thread(&self) -> Result<(), DriverError> {
         self.check_err()?;
+        self.make_current()
+    }
+
+    /// Makes this context current on the calling thread if it is not already,
+    /// without reading or clearing the error recorded by
+    /// [`record_err`](Self::record_err).
+    ///
+    /// For cleanup and retirement paths that must neither fail on, nor
+    /// consume, an unrelated error that is pending for the caller's next
+    /// [`check_err`](Self::check_err) or [`bind_to_thread`](Self::bind_to_thread).
+    pub fn make_current(&self) -> Result<(), DriverError> {
         if match ctx::get_current()? {
             Some(curr_ctx) => curr_ctx != self.cu_ctx,
             None => true,
@@ -469,7 +483,7 @@ impl Drop for MemPool {
         if !self.owned {
             return;
         }
-        let _ = self.context.bind_to_thread();
+        let _ = self.context.make_current();
         let _ = unsafe { pool::destroy(self.cu_pool) };
     }
 }
@@ -658,7 +672,18 @@ impl Event {
     /// (or the event was never recorded), `Ok(false)` while it is still in
     /// flight. Any other driver result is returned as the error.
     pub fn query(&self) -> Result<bool, DriverError> {
-        self.context.bind_to_thread()?;
+        self.context.check_err()?;
+        self.query_preserving_err()
+    }
+
+    /// [`query`](Self::query) without reading or clearing the error recorded
+    /// by [`Context::record_err`].
+    ///
+    /// For completion tracking: an unrelated error pending for the caller is
+    /// not a failure of this event, and must neither leak what waits on it
+    /// nor be consumed here.
+    pub(crate) fn query_preserving_err(&self) -> Result<bool, DriverError> {
+        self.context.make_current()?;
         // SAFETY: the handle is valid and its context is current.
         match unsafe { crate::cudarc_shim::event::query(self.cu_event) } {
             Ok(()) => Ok(true),
@@ -688,7 +713,9 @@ impl Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        self.context.record_err(self.context.bind_to_thread());
+        // `make_current` leaves an error already pending in the slot in place,
+        // instead of taking it and storing it back.
+        self.context.record_err(self.context.make_current());
         // Safety: owned handle; the driver defers destruction while in use.
         let _ = unsafe { crate::cudarc_shim::event::destroy(self.cu_event) };
     }
@@ -746,7 +773,9 @@ impl Drop for RetiredStream {
                 .push(self.handle);
         } else {
             let _guard = teardown_lock();
-            if self.context.bind_to_thread().is_err() {
+            // `make_current`: an unrelated error pending in the context's
+            // error slot must neither leak this stream nor be consumed here.
+            if self.context.make_current().is_err() {
                 // Preserve the context rather than releasing a resource whose
                 // teardown the driver could not perform safely.
                 std::mem::forget(self.context.clone());
@@ -760,16 +789,21 @@ impl Drop for RetiredStream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        // The last handle can die on the retirement worker on a user's behalf
+        // (a stream retained by a deferred free or a dropped submission). The
+        // slot-neutral queries below neither consume an unrelated error
+        // pending in the context's error slot nor mistake it for a fault of
+        // this stream, which would leak the handle or keep it out of the pool.
         let retired = RetiredStream {
             handle: self.cu_stream as usize,
             context: self.context.clone(),
             owned: self.owned,
             // Preserve priority semantics: only default-priority streams enter
             // the pool used by Context::new_stream.
-            reusable: self.context.owned && self.priority().ok() == Some(0),
+            reusable: self.context.owned && self.priority_preserving_err().ok() == Some(0),
             _keep_alive: self._keep_alive.clone(),
         };
-        match self.query() {
+        match self.query_preserving_err() {
             Ok(true) => drop(retired),
             Ok(false) => {
                 let _ = crate::completion::retain_until_complete(retired, self);
@@ -850,7 +884,18 @@ impl Stream {
     ///
     /// Binds the parent context to the calling thread before submitting.
     pub fn query(&self) -> Result<bool, DriverError> {
-        self.context.bind_to_thread()?;
+        self.context.check_err()?;
+        self.query_preserving_err()
+    }
+
+    /// [`query`](Self::query) without reading or clearing the error recorded
+    /// by [`Context::record_err`].
+    ///
+    /// For drop and retirement paths: an unrelated error pending for the
+    /// caller is not a failure of this stream, and must not be consumed here.
+    pub(crate) fn query_preserving_err(&self) -> Result<bool, DriverError> {
+        self.context.make_current()?;
+        // SAFETY: the handle is valid (RAII wrapper) and its context is current.
         unsafe { stream::query(self.cu_stream) }
     }
 
@@ -1006,7 +1051,7 @@ impl Drop for Module {
             return;
         }
         let _guard = teardown_lock();
-        let _ = self.context.bind_to_thread();
+        let _ = self.context.make_current();
         let _ = unsafe { module::unload(self.cu_module) };
     }
 }
