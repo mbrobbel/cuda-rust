@@ -11,7 +11,8 @@
 //! be identical before the backend mode is selected therefore uses CUDA generic
 //! pointers as the stable carrier and converts shared pointers at value
 //! boundaries. Enum payload storage also uses this module for its bool-byte
-//! canonicalization.
+//! canonicalization and, when a pointer-sized integer shares a pointer slot
+//! with another variant, for that integer's explicit `inttoptr`/`ptrtoint`.
 
 use llvm_export::op_interfaces::{CastOpInterface, CastOpWithNNegInterface};
 use llvm_export::ops as llvm;
@@ -183,11 +184,33 @@ fn rewrite_storage_type(
     }
 }
 
+/// Value-level conversions a coercion may insert beyond the address-space and
+/// bool-byte rewrites that every target-stable carrier needs.
+///
+/// The default allows nothing extra, so union, call, and memory carriers keep
+/// rejecting any integer/pointer mismatch. Only enum payload storage opts in,
+/// through [`coerce_target_stable_value_with`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ValueCoercionOptions {
+    /// Allow an integer of exactly a generic or global pointer's width and
+    /// that pointer to convert into each other with `inttoptr`/`ptrtoint`
+    /// (see `llvm_pointer_has_exact_integer_width`).
+    ///
+    /// Enum slot maps let a pointer-sized integer of one variant share the
+    /// pointer slot of another variant at the same bytes (see
+    /// `build_enum_slot_map`). The pointer keeps the slot, so its provenance
+    /// is never laundered; the integer crosses with explicit casts, and
+    /// `ptrtoint(inttoptr x) == x` at pointer width, so its value is exact.
+    pub pointer_sized_integer_views: bool,
+}
+
 enum ValueCoercion {
     BoolToByte,
     ByteToBool,
     SharedToGeneric,
     GenericToShared,
+    IntegerToPointer,
+    PointerToInteger,
     Array {
         target_element: TypeHandle,
         count: u64,
@@ -200,13 +223,37 @@ enum ValueCoercion {
 ///
 /// The conversion is symmetric and recursively rebuilds arrays and structs so
 /// pointer address-space conversions remain explicit SSA operations rather than
-/// bit reinterpretations.
+/// bit reinterpretations. Integer/pointer mismatches are rejected; see
+/// [`coerce_target_stable_value_with`] for the enum payload opt-in.
 pub(crate) fn coerce_target_stable_value(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     value: Value,
     target_ty: TypeHandle,
     role: &str,
+) -> Result<Value> {
+    coerce_target_stable_value_with(
+        ctx,
+        rewriter,
+        value,
+        target_ty,
+        role,
+        ValueCoercionOptions::default(),
+    )
+}
+
+/// [`coerce_target_stable_value`] with explicit [`ValueCoercionOptions`].
+///
+/// The options apply at every level of the recursive rebuild, so a
+/// `{i64, i64}` integer view converts leaf by leaf into `{ptr, i64}` storage
+/// with one `inttoptr` for the pointer leaf and plain copies for the rest.
+pub(crate) fn coerce_target_stable_value_with(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    value: Value,
+    target_ty: TypeHandle,
+    role: &str,
+    options: ValueCoercionOptions,
 ) -> Result<Value> {
     let source_ty = value.get_type(ctx);
     if source_ty == target_ty {
@@ -243,6 +290,18 @@ pub(crate) fn coerce_target_stable_value(
                 }
                 _ => ValueCoercion::Unsupported,
             }
+        } else if options.pointer_sized_integer_views
+            && source_integer.is_some_and(|width| {
+                crate::convert::types::llvm_pointer_has_exact_integer_width(ctx, target_ty, width)
+            })
+        {
+            ValueCoercion::IntegerToPointer
+        } else if options.pointer_sized_integer_views
+            && target_integer.is_some_and(|width| {
+                crate::convert::types::llvm_pointer_has_exact_integer_width(ctx, source_ty, width)
+            })
+        {
+            ValueCoercion::PointerToInteger
         } else if let (Some(source_array), Some(target_array)) = (
             source_ref.downcast_ref::<llvm_types::ArrayType>(),
             target_ref.downcast_ref::<llvm_types::ArrayType>(),
@@ -285,6 +344,16 @@ pub(crate) fn coerce_target_stable_value(
             rewriter.insert_operation(ctx, cast.get_operation());
             Ok(cast.get_operation().deref(ctx).get_result(0))
         }
+        ValueCoercion::IntegerToPointer => {
+            let cast = llvm::IntToPtrOp::new(ctx, value, target_ty);
+            rewriter.insert_operation(ctx, cast.get_operation());
+            Ok(cast.get_operation().deref(ctx).get_result(0))
+        }
+        ValueCoercion::PointerToInteger => {
+            let cast = llvm::PtrToIntOp::new(ctx, value, target_ty);
+            rewriter.insert_operation(ctx, cast.get_operation());
+            Ok(cast.get_operation().deref(ctx).get_result(0))
+        }
         ValueCoercion::Array {
             target_element,
             count,
@@ -299,8 +368,14 @@ pub(crate) fn coerce_target_stable_value(
                 let extract = llvm::ExtractValueOp::new(ctx, value, vec![index])?;
                 rewriter.insert_operation(ctx, extract.get_operation());
                 let element = extract.get_operation().deref(ctx).get_result(0);
-                let converted =
-                    coerce_target_stable_value(ctx, rewriter, element, target_element, role)?;
+                let converted = coerce_target_stable_value_with(
+                    ctx,
+                    rewriter,
+                    element,
+                    target_element,
+                    role,
+                    options,
+                )?;
                 let insert = llvm::InsertValueOp::new(ctx, current, converted, vec![index]);
                 rewriter.insert_operation(ctx, insert.get_operation());
                 current = insert.get_operation().deref(ctx).get_result(0);
@@ -318,8 +393,14 @@ pub(crate) fn coerce_target_stable_value(
                 let extract = llvm::ExtractValueOp::new(ctx, value, vec![index])?;
                 rewriter.insert_operation(ctx, extract.get_operation());
                 let field = extract.get_operation().deref(ctx).get_result(0);
-                let converted =
-                    coerce_target_stable_value(ctx, rewriter, field, target_field, role)?;
+                let converted = coerce_target_stable_value_with(
+                    ctx,
+                    rewriter,
+                    field,
+                    target_field,
+                    role,
+                    options,
+                )?;
                 let insert = llvm::InsertValueOp::new(ctx, current, converted, vec![index]);
                 rewriter.insert_operation(ctx, insert.get_operation());
                 current = insert.get_operation().deref(ctx).get_result(0);

@@ -21,7 +21,8 @@
 //! separate ABI and address-space-cast semantics.
 
 use crate::convert::target_stable_storage::{
-    StorageRewriteOptions, coerce_target_stable_value, target_stable_storage_type,
+    StorageRewriteOptions, ValueCoercionOptions, coerce_target_stable_value_with,
+    target_stable_storage_type,
 };
 use pliron::context::Context;
 use pliron::irbuild::dialect_conversion::DialectConversionRewriter;
@@ -70,12 +71,24 @@ pub(crate) fn enum_payload_storage_type(
 ///
 /// This is symmetric and recursively rebuilds aggregates, inserting explicit
 /// address-space casts for shared pointer leaves and widening/narrowing bool
-/// leaves to/from their canonical storage byte representation.
+/// leaves to/from their canonical storage byte representation. A
+/// pointer-sized integer leaf stored in a pointer slot that another variant
+/// owns (an integer view, see `build_enum_slot_map`) crosses with an
+/// explicit `inttoptr`/`ptrtoint`; that opt-in is scoped to enum payloads.
 pub(crate) fn coerce_enum_payload_value(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     value: Value,
     target_ty: TypeHandle,
 ) -> Result<Value> {
-    coerce_target_stable_value(ctx, rewriter, value, target_ty, "enum payload storage")
+    coerce_target_stable_value_with(
+        ctx,
+        rewriter,
+        value,
+        target_ty,
+        "enum payload storage",
+        ValueCoercionOptions {
+            pointer_sized_integer_views: true,
+        },
+    )
 }

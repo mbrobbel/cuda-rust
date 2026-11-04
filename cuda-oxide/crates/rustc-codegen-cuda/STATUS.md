@@ -15,7 +15,7 @@ Run `cuda-oxide/scripts/check-error-example-status.sh` to verify both are in syn
 | :------------------------------------- | :------------------ | :----------------------------------- |
 | `error`                                | diagnostics-fixture | `core::fmt` reachable from device    |
 | `error_enum_bool_payload_addr`         | diagnostics-fixture | `&mut` to a canonical-byte payload   |
-| `error_enum_pointer_overlap`           | support-gap         | Overlaid pointer/integer payload     |
+| `error_enum_pointer_overlap`           | support-gap         | Partially overlaid pointer/integer payload |
 | `error_enum_shared_pointer_layout`     | support-gap         | Oversized AS3 pointer arrays/vectors |
 | `error_generated_intrinsic_abi`        | diagnostics-fixture | Unsupported raw intrinsic ABI        |
 | `error_generated_intrinsic_callable`   | diagnostics-fixture | Raw intrinsic passed through `Fn`    |

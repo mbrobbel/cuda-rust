@@ -18,6 +18,7 @@ use pliron::r#type::TypeHandle;
 use super::layout::{alignment_anchor_type, make_enum_filler_type, mir_type_contains_i1};
 use super::pointer_storage::{
     PointerOverlapRejection, analyze_pointer_overlap, llvm_type_contains_pointer,
+    llvm_type_is_integer_view_of_pointer_storage,
 };
 use super::struct_layout::{StructLayoutInfo, build_struct_slot_map};
 use super::{
@@ -260,7 +261,11 @@ fn try_decompose_aggregate_payload(
 /// - own slot:   the field's bytes collide with nothing already placed.
 /// - shared slot: another variant already placed the SAME type at the
 ///                SAME position; both map to that slot. (If B were
-///                B(u32), A and B would simply share slot 1.)
+///                B(u32), A and B would simply share slot 1.) A field
+///                that is an exact integer view of another variant's
+///                pointer storage (`u64` vs `*const u8`, `(usize, usize)`
+///                vs `&[u8]`) shares that pointer's slot too; it crosses
+///                with `inttoptr`/`ptrtoint`, the pointer stays a `ptr`.
 /// - leaf slots: a colliding AGGREGATE whose every leaf either matches an
 ///                existing claim (the niche carrier backing its pointer
 ///                leaf) or lands on unclaimed bytes decomposes into one
@@ -433,16 +438,53 @@ pub(crate) fn build_enum_slot_map(
             *count as usize,
         ));
     }
+    // A field that is only an integer view of another inhabited field's
+    // pointer-bearing storage at the same byte position (same shape, with
+    // pointer-sized integers where that field has pointers) yields to it, so
+    // the pointer always claims the bytes as a real `ptr` and the integer
+    // view shares that claim below, whatever the variant order. Storage
+    // types that fail to convert are ignored here; the main loop reports
+    // them. No other field changes position.
+    let yields_to_pointer_storage: Vec<bool> = {
+        let mut storage_tys = Vec::with_capacity(field_llvm_types.len());
+        for (flat, &llvm_ty) in field_llvm_types.iter().enumerate() {
+            let inhabited = field_is_inhabited.get(flat).copied().unwrap_or(false);
+            storage_tys.push(if inhabited {
+                enum_payload_storage_type(ctx, llvm_ty).ok()
+            } else {
+                None
+            });
+        }
+        (0..storage_tys.len())
+            .map(|flat| {
+                storage_tys[flat].is_some_and(|incoming| {
+                    storage_tys.iter().enumerate().any(|(other, storage)| {
+                        other != flat
+                            && all_field_offsets[other] == all_field_offsets[flat]
+                            && storage.is_some_and(|pointer_storage| {
+                                llvm_type_is_integer_view_of_pointer_storage(
+                                    ctx,
+                                    incoming,
+                                    pointer_storage,
+                                )
+                            })
+                    })
+                })
+            })
+            .collect()
+    };
     let mut order: Vec<usize> = (0..field_llvm_types.len()).collect();
     // At one byte position, prefer a representation that preserves all of
     // its stored bits. This makes the result independent of source-variant
     // order and prevents an i1/bool view from claiming storage that a later
     // i8 view needs to preserve. A scalar i1 always uses an i8 storage claim:
-    // construction explicitly zero-extends that scalar below.
+    // construction explicitly zero-extends that scalar below. Integer views
+    // of pointer storage then go after the pointer-bearing field they view.
     order.sort_by_key(|&i| {
         (
             all_field_offsets[i],
             !llvm_type_is_byte_faithful(ctx, field_llvm_types[i]),
+            yields_to_pointer_storage[i],
             i,
         )
     });
@@ -576,13 +618,37 @@ pub(crate) fn build_enum_slot_map(
             }
             continue;
         }
+        // Another variant already placed pointer-bearing storage at exactly
+        // these bytes, and this field has the same shape with pointer-sized
+        // integers where that storage has pointers: `enum { Bits(u64),
+        // Ptr(*const u8) }`, or `Result<&[u8], (usize, usize)>`. The pointer
+        // keeps the slot as a real `ptr`, so its provenance is preserved; this
+        // field shares it and crosses with explicit `inttoptr` at construction
+        // and `ptrtoint` at extraction (`coerce_enum_payload_value`), which
+        // round-trips its value exactly. rustc's own layout makes the same
+        // choice for a scalar int/pointer pair: `rustc_abi` represents it as a
+        // pointer "to avoid roundtripping pointers through ptrtoint/inttoptr".
+        // The niche carrier is excluded: its bits encode the discriminant.
+        if field_gets_slot
+            && let Some(ci) = claims.iter().enumerate().position(|(ci, &(o, s, t))| {
+                Some(ci) != carrier_claim
+                    && o == offset
+                    && s == size
+                    && llvm_type_is_integer_view_of_pointer_storage(ctx, storage_ty, t)
+            })
+        {
+            claim_of_field[flat] = Some(ci);
+            continue;
+        }
         // The bytes are taken by a different type. Pointer-free values can
         // use the memory fallback below. Pointer-bearing values may do so only
         // when a physical-layout walk proves that every pointer leaf exactly
         // matches an existing pointer slot. This is the common
         // `Option<(usize, &T)>` shape: the niche carrier is the tuple's pointer
-        // field. A pointer/non-pointer overlap, address-space mismatch, or
-        // additional pointer without a pointer slot still fails closed.
+        // field. Any other pointer/non-pointer overlap (a pointer split across
+        // narrower integers, a float or differently sized integer over a
+        // pointer), an address-space mismatch, or an additional pointer
+        // without a pointer slot still fails closed.
         let colliding_claims = claims
             .iter()
             .filter(|&&(o, s, _)| offset < o + s && o < offset + size)
@@ -615,8 +681,10 @@ pub(crate) fn build_enum_slot_map(
             // pointer leaf (the extra slice pointer in `split_at_mut_checked`'s
             // `Option<(&mut [T], &mut [T])>`) gets its own fresh `ptr` slot.
             // `ProvenanceLoss` means a pointer punned against non-pointer
-            // bits, which stays fail-closed; `OverArrayLeafBound` reports the
-            // same bounded rewrite contract as the payload storage gate.
+            // bits that are not an exact integer view of it (those shared the
+            // pointer slot above), which stays fail-closed;
+            // `OverArrayLeafBound` reports the same bounded rewrite contract
+            // as the payload storage gate.
             let extra_pointer_claims = if has_pointer_overlap {
                 match analyze_pointer_overlap(ctx, offset, size, storage_ty, &colliding_claims) {
                     Ok(extra) => extra,
@@ -847,7 +915,7 @@ mod tests {
     use super::super::test_support::{llvm_int, make_ctx, mir_uint, struct_fields};
     use super::*;
     use dialect_mir::types::{EnumEncoding, EnumVariant, MirArrayType, MirPtrType};
-    use pliron::builtin::types::FP32Type;
+    use pliron::builtin::types::{FP32Type, FP64Type};
 
     #[test]
     fn enum_array_payload_keeps_exact_size_alignment_and_stride() {
@@ -1156,38 +1224,273 @@ mod tests {
         assert!(map.field_slots[0].is_some());
     }
 
+    /// A two-variant Direct-tagged enum whose variants each carry one field
+    /// at byte `payload_offset`, the shape rustc gives `Result<A, B>` and
+    /// `#[repr(C)] enum { A(a), B(b) }` when both payloads start after the tag.
+    fn two_payload_enum(
+        ctx: &mut Context,
+        tag_width: u32,
+        first: TypeHandle,
+        second: TypeHandle,
+        payload_offset: u64,
+        total_size: u64,
+    ) -> TypeHandle {
+        let discr = mir_uint(ctx, tag_width);
+        let mut sizes = Vec::new();
+        for ty in [first, second] {
+            let converted = convert_type(ctx, ty).unwrap();
+            sizes.push(llvm_type_size_align(ctx, converted).unwrap().0);
+        }
+        MirEnumType::get_with_encoding(
+            ctx,
+            "TwoPayloads".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout(
+                    "First".into(),
+                    vec![first],
+                    vec![payload_offset],
+                    vec![sizes[0]],
+                ),
+                EnumVariant::new_with_layout(
+                    "Second".into(),
+                    vec![second],
+                    vec![payload_offset],
+                    vec![sizes[1]],
+                ),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: tag_width,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into()
+    }
+
+    /// `enum { Bits(u64), Ptr(*const u8) }`: the pointer keeps the shared
+    /// slot as a real `ptr` and the pointer-sized integer shares it (crossing
+    /// with explicit `inttoptr`/`ptrtoint`), independent of declaration order.
+    /// This used to be rejected as a provenance-erasing overlap.
     #[test]
-    fn enum_slot_map_rejects_pointer_nonpointer_overlap_in_either_variant_order() {
+    fn enum_slot_map_shares_pointer_slot_with_pointer_sized_integer_in_either_variant_order() {
         for pointer_first in [false, true] {
+            let mut ctx = make_ctx();
+            let u8_ty = mir_uint(&mut ctx, 8);
+            let u64_ty = mir_uint(&mut ctx, 64);
+            let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+            let (first, second) = if pointer_first {
+                (pointer, u64_ty)
+            } else {
+                (u64_ty, pointer)
+            };
+            let enum_ty = two_payload_enum(&mut ctx, 32, first, second, 8, 16);
+            let map = build_enum_slot_map(&mut ctx, enum_ty).unwrap_or_else(|error| {
+                panic!("pointer_first={pointer_first}: integer view must share: {error}")
+            });
+            assert_eq!(
+                llvm_type_size_align(&ctx, map.llvm_struct_ty),
+                Some((16, 8))
+            );
+            let fields = struct_fields(&ctx, map.llvm_struct_ty);
+            let pointer_slot = fields.len() - 1;
+            assert!(
+                fields[pointer_slot]
+                    .deref(&ctx)
+                    .is::<llvm_types::PointerType>(),
+                "pointer_first={pointer_first}: the shared slot must stay a real ptr"
+            );
+            assert_eq!(
+                map.field_slots,
+                vec![Some(pointer_slot as u32), Some(pointer_slot as u32)],
+                "pointer_first={pointer_first}: both variants must use the ptr slot"
+            );
+        }
+    }
+
+    /// `Result<&[u8], (usize, usize)>` (issue: `checked` slicing helpers that
+    /// return `Err((index, len))`): the slice's `{ptr, i64}` storage owns
+    /// bytes 8..24 and the integer pair shares it as an integer view, in
+    /// either variant order. The tag keeps rustc's widened 64-bit carrier.
+    #[test]
+    fn enum_slot_map_shares_slice_storage_with_integer_pair_in_either_variant_order() {
+        for slice_first in [false, true] {
+            let mut ctx = make_ctx();
+            let u8_ty = mir_uint(&mut ctx, 8);
+            let u64_ty = mir_uint(&mut ctx, 64);
+            let slice: TypeHandle = MirSliceType::get(&mut ctx, u8_ty).into();
+            let pair: TypeHandle = MirTupleType::get(&mut ctx, vec![u64_ty, u64_ty]).into();
+            let (first, second) = if slice_first {
+                (slice, pair)
+            } else {
+                (pair, slice)
+            };
+            let enum_ty = two_payload_enum(&mut ctx, 64, first, second, 8, 24);
+            let map = build_enum_slot_map(&mut ctx, enum_ty).unwrap_or_else(|error| {
+                panic!("slice_first={slice_first}: integer pair must share: {error}")
+            });
+            assert_eq!(
+                llvm_type_size_align(&ctx, map.llvm_struct_ty),
+                Some((24, 8))
+            );
+            let fields = struct_fields(&ctx, map.llvm_struct_ty);
+            let i64_ty = llvm_int(&mut ctx, 64);
+            let ptr_ty: TypeHandle =
+                llvm_types::PointerType::get(&ctx, llvm_types::address_space::GENERIC).into();
+            let slice_storage: TypeHandle = llvm_types::StructType::get_unnamed(
+                &ctx,
+                (vec![ptr_ty, i64_ty], llvm_types::StructLayout::Unpacked),
+            )
+            .into();
+            assert_eq!(
+                fields,
+                vec![i64_ty, slice_storage],
+                "slice_first={slice_first}: expected {{tag, {{ptr, i64}}}}"
+            );
+            assert_eq!(map.field_slots, vec![Some(1), Some(1)]);
+            assert_eq!(map.field_leaf_slots, vec![None, None]);
+        }
+    }
+
+    /// A pointer overlaid by two `u32` halves is a partial overlap: no pair
+    /// of whole-slot casts can rebuild it, so it stays fail-closed.
+    #[test]
+    fn enum_slot_map_rejects_partial_integer_view_of_pointer_in_either_variant_order() {
+        for pointer_first in [false, true] {
+            let mut ctx = make_ctx();
+            let u8_ty = mir_uint(&mut ctx, 8);
+            let u32_ty = mir_uint(&mut ctx, 32);
+            let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+            let halves: TypeHandle = MirTupleType::get(&mut ctx, vec![u32_ty, u32_ty]).into();
+            let (first, second) = if pointer_first {
+                (pointer, halves)
+            } else {
+                (halves, pointer)
+            };
+            let enum_ty = two_payload_enum(&mut ctx, 32, first, second, 8, 16);
+            let error = build_enum_slot_map(&mut ctx, enum_ty)
+                .err()
+                .expect("a split integer view of a pointer must reject");
+            assert!(
+                error.to_string().contains("pointer provenance"),
+                "pointer_first={pointer_first}: {error}"
+            );
+        }
+    }
+
+    /// Only integers are pointer views: a float overlaid on a pointer would
+    /// need a bitcast through an integer, which this rule does not model.
+    #[test]
+    fn enum_slot_map_rejects_float_view_of_pointer_in_either_variant_order() {
+        for pointer_first in [false, true] {
+            let mut ctx = make_ctx();
+            let u8_ty = mir_uint(&mut ctx, 8);
+            let f64_ty: TypeHandle = FP64Type::get(&ctx).into();
+            let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+            let (first, second) = if pointer_first {
+                (pointer, f64_ty)
+            } else {
+                (f64_ty, pointer)
+            };
+            let enum_ty = two_payload_enum(&mut ctx, 32, first, second, 8, 16);
+            let error = build_enum_slot_map(&mut ctx, enum_ty)
+                .err()
+                .expect("a float view of a pointer must reject");
+            assert!(
+                error.to_string().contains("pointer provenance"),
+                "pointer_first={pointer_first}: {error}"
+            );
+        }
+    }
+
+    /// A shared integer view must not bridge two pointers that disagree on
+    /// address space: `{ Bits(u64), Generic(*const u8), Global(*mut u8 AS1) }`
+    /// still rejects whichever pointer claims the bytes first.
+    #[test]
+    fn enum_slot_map_integer_view_does_not_bridge_pointer_address_spaces() {
+        for bits_first in [false, true] {
             let mut ctx = make_ctx();
             let discr = mir_uint(&mut ctx, 32);
             let u8_ty = mir_uint(&mut ctx, 8);
             let u64_ty = mir_uint(&mut ctx, 64);
-            let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
-            let (first_name, first_ty, second_name, second_ty) = if pointer_first {
-                ("Ptr", pointer, "Bits", u64_ty)
+            let generic: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+            let global: TypeHandle = MirPtrType::get_global(&mut ctx, u8_ty, true).into();
+            let payloads = if bits_first {
+                [u64_ty, generic, global]
             } else {
-                ("Bits", u64_ty, "Ptr", pointer)
+                [generic, global, u64_ty]
             };
+            let variants = payloads
+                .iter()
+                .enumerate()
+                .map(|(index, &ty)| {
+                    EnumVariant::new_with_layout(format!("V{index}"), vec![ty], vec![8], vec![8])
+                })
+                .collect();
             let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
                 &mut ctx,
-                "PointerOrBits".into(),
+                "MixedPointerSpaces".into(),
+                discr,
+                vec![0, 1, 2],
+                variants,
+                EnumEncoding {
+                    tag_offset: 0,
+                    total_size: 16,
+                    abi_align: 8,
+                    layout_kind: EnumLayoutKind::Direct,
+                    carrier_kind: EnumCarrierKind::Integer,
+                    carrier_width: 32,
+                    variant_inhabited: vec![1, 1, 1],
+                    ..EnumEncoding::default()
+                },
+            )
+            .into();
+            let error = build_enum_slot_map(&mut ctx, enum_ty)
+                .err()
+                .expect("pointers in different address spaces must not share one slot");
+            assert!(
+                error.to_string().contains("pointer provenance"),
+                "bits_first={bits_first}: {error}"
+            );
+        }
+    }
+
+    /// Constant-space (AS4) pointers may be narrowed to 32 bits by llc's
+    /// `--nvptx-short-ptr` even though lowering sizes every pointer at eight
+    /// bytes, so `{ Bits(u64), Constant(*const u8 AS4) }` must not share the
+    /// pointer slot: an `inttoptr`/`ptrtoint` round trip would not be exact.
+    #[test]
+    fn enum_slot_map_integer_view_requires_width_stable_pointer_address_space() {
+        for bits_first in [false, true] {
+            let mut ctx = make_ctx();
+            let discr = mir_uint(&mut ctx, 32);
+            let u8_ty = mir_uint(&mut ctx, 8);
+            let u64_ty = mir_uint(&mut ctx, 64);
+            let constant: TypeHandle = MirPtrType::get_constant(&mut ctx, u8_ty, false).into();
+            let payloads = if bits_first {
+                [u64_ty, constant]
+            } else {
+                [constant, u64_ty]
+            };
+            let variants = payloads
+                .iter()
+                .enumerate()
+                .map(|(index, &ty)| {
+                    EnumVariant::new_with_layout(format!("V{index}"), vec![ty], vec![8], vec![8])
+                })
+                .collect();
+            let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+                &mut ctx,
+                "ConstantPointerOrBits".into(),
                 discr,
                 vec![0, 1],
-                vec![
-                    EnumVariant::new_with_layout(
-                        first_name.into(),
-                        vec![first_ty],
-                        vec![8],
-                        vec![8],
-                    ),
-                    EnumVariant::new_with_layout(
-                        second_name.into(),
-                        vec![second_ty],
-                        vec![8],
-                        vec![8],
-                    ),
-                ],
+                variants,
                 EnumEncoding {
                     tag_offset: 0,
                     total_size: 16,
@@ -1202,12 +1505,44 @@ mod tests {
             .into();
             let error = build_enum_slot_map(&mut ctx, enum_ty)
                 .err()
-                .expect("pointer overlap must reject");
+                .expect("a u64 must not share a constant-space pointer slot");
             assert!(
                 error.to_string().contains("pointer provenance"),
-                "pointer_first={pointer_first}: {error}"
+                "bits_first={bits_first}: {error}"
             );
         }
+    }
+
+    /// The pointer-slot preference only reorders fields that are exact
+    /// integer views of a pointer-bearing field. `{ Num(u64), Span(Span) }`
+    /// with `Span { start: u64, text: *const u8, len: u64 }` at the same
+    /// offset is not one (the sizes differ), so `Num` still claims byte 8 and
+    /// `Span` still decomposes into SSA leaf slots instead of spilling.
+    #[test]
+    fn enum_slot_map_pointer_preference_keeps_unrelated_leaf_decomposition() {
+        let mut ctx = make_ctx();
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u64_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let span: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Span".into(),
+            vec!["start".into(), "text".into(), "len".into()],
+            vec![u64_ty, pointer, u64_ty],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            24,
+            8,
+        )
+        .into();
+        let enum_ty = two_payload_enum(&mut ctx, 32, u64_ty, span, 8, 32);
+        let map = build_enum_slot_map(&mut ctx, enum_ty).unwrap();
+        let num_slot = map.field_slots[0].expect("Num keeps its own i64 slot");
+        let leaves = map.field_leaf_slots[1]
+            .as_ref()
+            .expect("Span keeps its SSA leaf decomposition");
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].1, num_slot, "Span.start shares Num's i64 slot");
     }
 
     #[test]

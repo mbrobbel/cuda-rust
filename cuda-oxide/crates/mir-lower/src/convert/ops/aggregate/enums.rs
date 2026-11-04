@@ -1305,6 +1305,126 @@ mod tests {
         check(2, vec![2], false);
     }
 
+    /// Lower `construct(variant, arg)` followed by a payload read of the same
+    /// variant for `enum PointerOrBits { Bits(u64), Pointer(*const u8) }`,
+    /// returning the context, the module, and the enum's slot map.
+    fn lower_pointer_or_bits_round_trip(
+        variant_index: u32,
+    ) -> (Context, Ptr<Operation>, EnumSlotMap) {
+        let mut ctx = make_ctx();
+        let discr: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let bits: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "PointerOrBits".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Bits".into(), vec![bits], vec![8], vec![8]),
+                EnumVariant::new_with_layout("Pointer".into(), vec![pointer], vec![8], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let slot_map = build_enum_slot_map(&mut ctx, enum_ty).expect("integer view shares");
+
+        let payload_ty = if variant_index == 0 { bits } else { pointer };
+        let (module, block) = build_kernel(&mut ctx, vec![payload_ty], vec![payload_ty]);
+        let argument = block.deref(&ctx).get_argument(0);
+        let construct = Operation::new(
+            &mut ctx,
+            MirConstructEnumOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![argument],
+            vec![],
+            0,
+        );
+        MirConstructEnumOp::new(construct)
+            .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(variant_index));
+        construct.insert_at_back(block, &ctx);
+        let enum_value = construct.deref(&ctx).get_result(0);
+
+        let payload = Operation::new(
+            &mut ctx,
+            MirEnumPayloadOp::get_concrete_op_info(),
+            vec![payload_ty],
+            vec![enum_value],
+            vec![],
+            0,
+        );
+        let payload_op = MirEnumPayloadOp::new(payload);
+        payload_op.set_attr_payload_variant_index(&ctx, VariantIndexAttr(variant_index));
+        payload_op.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+        payload.insert_at_back(block, &ctx);
+        let result = payload.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![result]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering failed");
+        (ctx, module, slot_map)
+    }
+
+    /// The integer variant of `PointerOrBits` crosses into the shared `ptr`
+    /// slot with exactly one `inttoptr` at construction and back out with
+    /// exactly one `ptrtoint` at payload extraction, staying in SSA. That
+    /// pair is value-exact (`ptrtoint(inttoptr x) == x` at pointer width).
+    #[test]
+    fn integer_view_of_pointer_slot_round_trips_through_int_pointer_casts() {
+        let (ctx, module, slot_map) = lower_pointer_or_bits_round_trip(0);
+        let pointer_slot = slot_map.field_slots[1].expect("pointer owns a slot");
+        assert_eq!(slot_map.field_slots[0], Some(pointer_slot));
+        let body = kernel_blocks(&ctx, module);
+        let int_to_ptrs = find_all::<llvm::IntToPtrOp>(&ctx, &body);
+        assert_eq!(
+            int_to_ptrs.len(),
+            1,
+            "constructing Bits must convert its integer into the ptr slot once"
+        );
+        let cast = int_to_ptrs[0].get_operation().deref(&ctx).get_result(0);
+        let inserted_at: Vec<Vec<u32>> = find_all::<llvm::InsertValueOp>(&ctx, &body)
+            .iter()
+            .filter(|insert| insert.get_operation().deref(&ctx).get_operand(1) == cast)
+            .map(|insert| insert.indices(&ctx))
+            .collect();
+        assert_eq!(
+            inserted_at,
+            vec![vec![pointer_slot]],
+            "the inttoptr result must land in the shared ptr slot"
+        );
+        assert_eq!(
+            count_ops::<llvm::PtrToIntOp>(&ctx, &body),
+            1,
+            "reading Bits must convert the ptr slot back to its integer once"
+        );
+        assert_eq!(
+            count_ops::<llvm::AllocaOp>(&ctx, &body),
+            0,
+            "the shared slot keeps construction and extraction out of memory"
+        );
+    }
+
+    /// The pointer variant of `PointerOrBits` owns the shared slot as a real
+    /// `ptr`: it never round-trips through an integer, so its provenance is
+    /// preserved.
+    #[test]
+    fn pointer_owner_of_shared_slot_never_casts_through_an_integer() {
+        let (ctx, module, _slot_map) = lower_pointer_or_bits_round_trip(1);
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(count_ops::<llvm::IntToPtrOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::PtrToIntOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 0);
+    }
+
     /// SetDiscriminant must use the slot map instead of assuming that the tag
     /// is field zero, and its GEP must retain the source pointer's GPU address
     /// space. This shape puts an i64 payload first and an i8 tag above the

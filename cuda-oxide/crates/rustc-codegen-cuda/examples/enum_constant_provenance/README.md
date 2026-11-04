@@ -28,5 +28,9 @@ Expected result:
 enum_constant_provenance: PASS
 ```
 
-Pointer/integer overlapping enum storage, address-space-3 pointer layouts, and
-anonymous promoted allocations remain unsupported.
+Enum constants whose pointer payload overlaps a pointer-sized integer at the
+same offset (for example `enum E { Bits(u64), Ref(&'static u64) }`) share the
+pointer slot like non-constant values (see `enum_pointer_int_overlap`).
+Partial pointer/integer overlaps (such as a pointer over two `u32` fields),
+address-space-3 pointer layouts, and anonymous promoted allocations remain
+unsupported.

@@ -144,7 +144,7 @@ pub(crate) use layout::{
 pub(crate) use layout::MAX_NATURAL_ALIGN;
 pub(crate) use packed_shared_shape::packed_shared_mir_shape_is_supported;
 pub(crate) use pointer_storage::{
-    llvm_packed_struct_contains_pointer_in_address_space,
+    llvm_packed_struct_contains_pointer_in_address_space, llvm_pointer_has_exact_integer_width,
     llvm_type_contains_pointer_in_address_space,
 };
 pub use struct_layout::struct_value_lowering_is_byte_faithful;

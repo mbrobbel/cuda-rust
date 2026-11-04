@@ -3,22 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Negative test: overlapping enum payloads cannot mix pointers and integers
-//! until lowering can preserve LLVM pointer provenance through the shared slot.
+//! Negative test: an enum payload that splits a pointer's bytes across two
+//! narrower integers cannot share storage with that pointer.
+//!
+//! A pointer-sized integer overlaying the pointer exactly shares its slot
+//! through explicit `inttoptr`/`ptrtoint` (see `enum_pointer_int_overlap`).
+//! Two `u32` halves are no such integer view, so lowering still refuses to
+//! erase LLVM pointer provenance here.
 
 use cuda_device::kernel;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PointerOrBits {
-    Bits(u64),
+    Bits(u32, u32),
     Pointer(*const u8),
 }
 
 #[inline(never)]
 fn value_bits(value: PointerOrBits) -> u64 {
     match value {
-        PointerOrBits::Bits(bits) => bits,
+        PointerOrBits::Bits(low, high) => (u64::from(high) << 32) | u64::from(low),
         PointerOrBits::Pointer(pointer) => pointer as u64,
     }
 }
@@ -38,7 +43,7 @@ pub unsafe fn enum_pointer_overlap(input: *const PointerOrBits, out: *mut u64) {
 fn main() {
     // Keep both variants reachable in the host crate as well as device MIR.
     let values = [
-        PointerOrBits::Bits(7),
+        PointerOrBits::Bits(7, 0),
         PointerOrBits::Pointer(core::ptr::null()),
     ];
     println!(

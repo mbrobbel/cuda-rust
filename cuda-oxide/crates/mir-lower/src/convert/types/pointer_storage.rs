@@ -6,6 +6,7 @@
 //! Pointer provenance/overlap analysis over lowered LLVM aggregate storage.
 
 use llvm_export::types as llvm_types;
+use pliron::builtin::types::IntegerType;
 use pliron::context::Context;
 use pliron::r#type::TypeHandle;
 
@@ -219,9 +220,13 @@ fn collect_llvm_pointer_storage(
 /// be represented without punning a pointer against non-pointer bits: an
 /// existing pointer slot the incoming field does not also carry at the same
 /// offset/size/address space, or an extra pointer leaf that would overlap an
-/// existing (necessarily non-pointer) claim. That genuine pointer/integer
-/// union stays fail-closed — there is no single LLVM slot type that is both
-/// provenance-carrying and integer-exact.
+/// existing (necessarily non-pointer) claim. The one pointer/integer union
+/// that is representable, a field that is an exact integer view of a pointer
+/// slot ([`llvm_type_is_integer_view_of_pointer_storage`]), shares that slot
+/// before this analysis runs. What still reaches here (a pointer split across
+/// narrower integers, a float or differently sized integer over a pointer, a
+/// pointer slot only partly covered) stays fail-closed: the slotless memory
+/// round-trip would reinterpret those bytes with no explicit cast.
 ///
 /// Returns [`PointerOverlapRejection::OverArrayLeafBound`] when a walked type
 /// holds more array-expanded pointer leaves than the bounded rewrite limit,
@@ -287,6 +292,111 @@ pub(super) fn analyze_pointer_overlap(
     }
 
     Ok(extra)
+}
+
+/// Whether `incoming` is an exact integer view of the pointer-bearing storage
+/// type `pointer_storage`.
+///
+/// True when the two types have the same shape (LLVM structs with the same
+/// packing and field count, arrays with the same length, identical leaves)
+/// except that at least one pointer leaf of `pointer_storage` is, in
+/// `incoming`, an integer of exactly that pointer's bit width. So
+/// `{i64, i64}` is an integer view of `{ptr, i64}` and `i64` of `ptr`, while
+/// `{i32, i32}` (a split pointer), `double`, `i32`, or any shape difference
+/// is not.
+///
+/// Such a field can share the pointer's slot: the pointer keeps a real `ptr`
+/// (its provenance is never laundered through an integer), and the integer
+/// view crosses with `inttoptr`/`ptrtoint`, which round-trips its value
+/// exactly. Only pointers accepted by [`llvm_pointer_has_exact_integer_width`]
+/// qualify; enum payload storage has already genericized shared pointers.
+pub(super) fn llvm_type_is_integer_view_of_pointer_storage(
+    ctx: &Context,
+    incoming: TypeHandle,
+    pointer_storage: TypeHandle,
+) -> bool {
+    /// Walk both types in lockstep; record whether any integer/pointer
+    /// substitution was needed. Returns false on any other difference.
+    fn walk(
+        ctx: &Context,
+        incoming: TypeHandle,
+        pointer_storage: TypeHandle,
+        substituted: &mut bool,
+    ) -> bool {
+        if incoming == pointer_storage {
+            return true;
+        }
+        let incoming_ref = incoming.deref(ctx);
+        let storage_ref = pointer_storage.deref(ctx);
+        if let Some(integer) = incoming_ref.downcast_ref::<IntegerType>()
+            && storage_ref.is::<llvm_types::PointerType>()
+        {
+            let exact = llvm_pointer_has_exact_integer_width(ctx, pointer_storage, integer.width());
+            *substituted |= exact;
+            return exact;
+        }
+        if let (Some(incoming_struct), Some(storage_struct)) = (
+            incoming_ref.downcast_ref::<llvm_types::StructType>(),
+            storage_ref.downcast_ref::<llvm_types::StructType>(),
+        ) {
+            if incoming_struct.layout() != storage_struct.layout()
+                || incoming_struct.num_fields() != storage_struct.num_fields()
+            {
+                return false;
+            }
+            let pairs: Vec<_> = incoming_struct
+                .fields()
+                .zip(storage_struct.fields())
+                .collect();
+            return pairs
+                .into_iter()
+                .all(|(field, storage_field)| walk(ctx, field, storage_field, substituted));
+        }
+        if let (Some(incoming_array), Some(storage_array)) = (
+            incoming_ref.downcast_ref::<llvm_types::ArrayType>(),
+            storage_ref.downcast_ref::<llvm_types::ArrayType>(),
+        ) {
+            return incoming_array.size() == storage_array.size()
+                && walk(
+                    ctx,
+                    incoming_array.elem_type(),
+                    storage_array.elem_type(),
+                    substituted,
+                );
+        }
+        false
+    }
+
+    let mut substituted = false;
+    walk(ctx, incoming, pointer_storage, &mut substituted) && substituted
+}
+
+/// Whether `pointer` is an LLVM pointer for which an `inttoptr`/`ptrtoint`
+/// round trip with an `integer_width`-bit integer is value-exact on every
+/// NVPTX target the backend may select.
+///
+/// Only generic and global pointers qualify: they are 64-bit in the minimal,
+/// legacy, and modern NVPTX data layouts, and llc's `--nvptx-short-ptr` does
+/// not narrow them. Shared, constant, local, and other specialised address
+/// spaces may be 32-bit physically even though [`llvm_type_size_align`]
+/// reports eight bytes, so they fail closed rather than truncate the integer.
+pub(crate) fn llvm_pointer_has_exact_integer_width(
+    ctx: &Context,
+    pointer: TypeHandle,
+    integer_width: u32,
+) -> bool {
+    let width_stable_space = pointer
+        .deref(ctx)
+        .downcast_ref::<llvm_types::PointerType>()
+        .is_some_and(|pointer| {
+            matches!(
+                pointer.address_space(),
+                llvm_types::address_space::GENERIC | llvm_types::address_space::GLOBAL
+            )
+        });
+    width_stable_space
+        && llvm_type_size_align(ctx, pointer)
+            .is_some_and(|(size, _)| size.checked_mul(8) == Some(u64::from(integer_width)))
 }
 
 pub(crate) fn llvm_type_contains_pointer_in_address_space(
