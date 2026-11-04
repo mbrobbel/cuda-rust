@@ -75,9 +75,11 @@ pub fn translate_block(
     // `terminator::is_dropped_panic_call`). Its statements exist only to build
     // what that call would have consumed -- the message `&str`, the
     // `format_args!` pieces -- and the block has no successor, so nothing they
-    // write can ever be read. Emitting the trap alone is what makes a panic
-    // carrying a message compile at all: a materialized `&str` constant has no
-    // device lowering, so translating those statements always fails.
+    // write can ever be read. Emitting the trap alone also keeps that
+    // message-building code out of the module. A plain `&str` message would
+    // translate, but a message with format arguments (`panic!("{}", x)`) builds
+    // `core::fmt` argument values that have no device lowering yet, so
+    // translating those statements would fail the whole kernel.
     //
     // A store *through a pointer* in such a block is dropped along with the
     // message. That stays inside the model cuda-oxide already uses for panics:

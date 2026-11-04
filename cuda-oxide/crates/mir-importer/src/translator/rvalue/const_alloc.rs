@@ -305,8 +305,6 @@ pub(super) fn translate_static_array_as_slice(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
-    use dialect_mir::ops::MirConstructSliceOp;
-
     let elem_mir_ty = types::translate_type(ctx, &elem_ty)?;
     let is_mutable = origin.is_mutable();
 
@@ -356,6 +354,38 @@ pub(super) fn translate_static_array_as_slice(
         )?
     };
 
+    Ok(construct_slice_with_len(
+        ctx,
+        data_ptr,
+        elem_mir_ty,
+        len,
+        origin,
+        block_ptr,
+        prev_after_data,
+        loc,
+    ))
+}
+
+/// Pair a slice data pointer with a constant length into a fat pointer.
+///
+/// Emits a `usize` `mir.constant` for `len` after `prev_op` (or at the front
+/// of `block_ptr`), then `mir.construct_slice(data_ptr, len)` typed as a slice
+/// of `elem_mir_ty` with `origin`'s pointer kind. Shared by the static-backed
+/// and promoted-global slice constant lowerings, which differ only in where
+/// `data_ptr` comes from. Returns the slice value and the last emitted op.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn construct_slice_with_len(
+    ctx: &mut Context,
+    data_ptr: Value,
+    elem_mir_ty: TypeHandle,
+    len: u64,
+    origin: facts::PointerOrigin,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> (Value, Option<Ptr<Operation>>) {
+    use dialect_mir::ops::MirConstructSliceOp;
+
     let usize_ty = types::get_usize_type(ctx);
     let len_attr = pliron::builtin::attributes::IntegerAttr::new(
         usize_ty,
@@ -371,7 +401,7 @@ pub(super) fn translate_static_array_as_slice(
     );
     len_op.deref_mut(ctx).set_loc(loc.clone());
     MirConstantOp::new(len_op).set_attr_value(ctx, len_attr);
-    match prev_after_data {
+    match prev_op {
         Some(prev) => len_op.insert_after(ctx, prev),
         None => len_op.insert_at_front(block_ptr, ctx),
     };
@@ -389,7 +419,7 @@ pub(super) fn translate_static_array_as_slice(
     construct.deref_mut(ctx).set_loc(loc);
     construct.insert_after(ctx, len_op);
 
-    Ok((construct.deref(ctx).get_result(0), Some(construct)))
+    (construct.deref(ctx).get_result(0), Some(construct))
 }
 
 /// Return relocation starts whose pointer-width storage overlaps
@@ -2279,5 +2309,110 @@ mod aggregate_relocation_tests {
             width_error.contains("width 4"),
             "diagnostic must report the short relocation: {width_error}"
         );
+    }
+}
+
+#[cfg(test)]
+// Tests build kinded fixture types directly; production code mints via facts::PointerOrigin.
+#[allow(clippy::disallowed_methods)]
+mod slice_construction_tests {
+    use super::*;
+    use dialect_mir::ops::MirConstructSliceOp;
+    use dialect_mir::types::{MirPointerKind, MirPtrType, MirSliceType};
+    use pliron::builtin::types::{IntegerType, Signedness};
+    use pliron::common_traits::Verify;
+    use pliron::linked_list::ContainsLinkedList;
+    use pliron::r#type::Typed;
+
+    /// Read the `u64` value of the `mir.constant` that defines `value`.
+    ///
+    /// Panics when `value` is not produced by a `mir.constant`, which is the
+    /// shape `construct_slice_with_len` must emit for the length operand.
+    fn constant_u64(ctx: &Context, value: Value) -> u64 {
+        let defining_op = value
+            .defining_op()
+            .expect("slice length must be an op result");
+        Operation::get_op::<MirConstantOp>(defining_op, ctx)
+            .expect("slice length must come from mir.constant")
+            .get_attr_value(ctx)
+            .expect("mir.constant must carry its value")
+            .value()
+            .to_u64()
+    }
+
+    /// The shared slice-constant tail pairs the data pointer with a `usize`
+    /// length constant, types the fat pointer from the element type and the
+    /// constant's pointer origin, and places both ops after `prev_op` (or at
+    /// the block front), so the static-backed and promoted-global lowerings
+    /// produce the same `construct_slice` shape.
+    #[test]
+    fn construct_slice_with_len_pairs_data_pointer_with_usize_length() {
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let elem_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let data_ty: TypeHandle =
+            MirPtrType::get_generic_with_kind(&mut ctx, elem_ty, false, MirPointerKind::RawConst)
+                .into();
+        let block = BasicBlock::new(&mut ctx, None, vec![data_ty]);
+        let data_ptr = block.deref(&ctx).get_argument(0);
+        let origin = facts::pointer_origin_of_raw_mutability(mir::Mutability::Not);
+
+        let (first, first_last) = construct_slice_with_len(
+            &mut ctx,
+            data_ptr,
+            elem_ty,
+            3,
+            origin,
+            block,
+            None,
+            Location::Unknown,
+        );
+        let first_construct = first_last.expect("construct_slice must be the last op");
+        let construct = Operation::get_op::<MirConstructSliceOp>(first_construct, &ctx)
+            .expect("the fat pointer must come from mir.construct_slice");
+        assert!(construct.verify(&ctx).is_ok());
+        assert_eq!(first, first_construct.deref(&ctx).get_result(0));
+
+        let operands: Vec<Value> = first_construct.deref(&ctx).operands().collect();
+        assert_eq!(operands.len(), 2);
+        assert_eq!(operands[0], data_ptr);
+        assert_eq!(constant_u64(&ctx, operands[1]), 3);
+        let usize_ty = types::get_usize_type(&mut ctx).to_handle();
+        assert_eq!(operands[1].get_type(&ctx), usize_ty);
+
+        {
+            let slice_ty = first.get_type(&ctx);
+            let slice_ty = slice_ty.deref(&ctx);
+            let slice = slice_ty
+                .downcast_ref::<MirSliceType>()
+                .expect("result must be a MirSliceType");
+            assert_eq!(slice.element_type(), elem_ty);
+            assert!(!slice.is_mutable());
+            assert_eq!(slice.pointer_kind(), MirPointerKind::RawConst);
+        }
+
+        // A second call anchored on the first construct is appended after it;
+        // the empty-slice length is still an explicit zero constant.
+        let (_, second_last) = construct_slice_with_len(
+            &mut ctx,
+            data_ptr,
+            elem_ty,
+            0,
+            origin,
+            block,
+            first_last,
+            Location::Unknown,
+        );
+        let second_construct = second_last.expect("construct_slice must be the last op");
+        let second_len = second_construct.deref(&ctx).get_operand(1);
+        assert_eq!(constant_u64(&ctx, second_len), 0);
+
+        let ops: Vec<Ptr<Operation>> = block.deref(&ctx).iter(&ctx).collect();
+        assert_eq!(ops.len(), 4);
+        assert_eq!(Some(ops[0]), operands[1].defining_op());
+        assert_eq!(ops[1], first_construct);
+        assert_eq!(Some(ops[2]), second_len.defining_op());
+        assert_eq!(ops[3], second_construct);
     }
 }

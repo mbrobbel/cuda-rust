@@ -366,9 +366,8 @@ The panic *message* vanishes with them. A block whose terminator is a diverging
 call into `core::panicking` lowers to `nvvm.trap` + `mir.unreachable` and
 nothing else -- its statements exist only to build what that dropped call would
 have consumed (the message `&str`, the `format_args!` pieces), and the block has
-no successor, so nothing they write can ever be read. Skipping them is also what
-makes a message-carrying panic compilable in the first place: a materialized
-`&str` constant has no device lowering.
+no successor, so nothing they write can ever be read. Skipping them also keeps
+the message-building code, which no device path consumes, out of the module.
 
 This is not as scary as it sounds. Rust's borrow checker and type system
 prevent most of the bugs that would cause panics. And for the ones that

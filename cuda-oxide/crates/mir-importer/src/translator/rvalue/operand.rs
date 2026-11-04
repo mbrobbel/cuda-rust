@@ -17,7 +17,7 @@ use super::const_bytes::{
 use super::const_enum::{read_uint_from_bytes, translate_enum_constant};
 use super::const_union::translate_union_constant;
 use super::place_read::translate_place;
-use super::promoted::translate_ptr_to_array_constant;
+use super::promoted::{translate_ptr_to_array_constant, translate_slice_constant};
 use super::static_global::{get_static_pointer_info, translate_static_global_pointer};
 use super::statics::{
     shared_static_source_identity, shared_static_source_name, static_target_from_constant,
@@ -1132,6 +1132,15 @@ pub fn translate_operand(
                 let val = const_op.get_operation().deref(ctx).get_result(0);
 
                 Ok((val, Some(const_op.get_operation())))
+            } else if const_ty_ptr
+                .deref(ctx)
+                .is::<dialect_mir::types::MirSliceType>()
+            {
+                // `&[T]` / `&str` over anonymous constant memory: string and
+                // byte literals, `&[..]` consts, sub-slices computed in a
+                // const. Slices over statics belong to the static branch
+                // above; one it did not lower fails closed in here.
+                translate_slice_constant(ctx, constant, &rust_ty, block_ptr, prev_op, loc)
             } else {
                 // No matching type handler — report what we got so it's clear what needs support.
                 let pliron_ty_dbg = format!("{:?}", const_ty_ptr.deref(ctx));
@@ -1141,7 +1150,7 @@ pub fn translate_operand(
                      \n  pliron type: {}\
                      \n  const repr : {}\
                      \n\
-                     \nThe type dispatch (ZST -> ptr_to_array -> array -> struct -> tuple -> enum -> union -> float -> pointer -> integer)\n\
+                     \nThe type dispatch (ZST -> ptr_to_array -> array -> struct -> tuple -> enum -> union -> float -> pointer -> integer -> slice)\n\
                      did not match this constant. A new handler may need to be added.",
                     rust_ty, pliron_ty_dbg, const_str
                 ))))

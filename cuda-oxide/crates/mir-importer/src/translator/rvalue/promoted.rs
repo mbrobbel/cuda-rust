@@ -5,18 +5,20 @@
 
 //! Promoted immutable device globals and their layout gates.
 
-use super::coerce::cast_to_declared_rust_pointer_type_if_needed;
+use super::coerce::{cast_to_declared_rust_pointer_type_if_needed, coerce_slice_data_pointee};
+use super::const_alloc::{construct_slice_with_len, slice_len_from_constant};
 use super::const_bytes::rust_type_layout_size;
 use super::static_global::{
     StaticGlobalMaterializationState, ensure_initializer_relocation_targets,
-    set_global_initializer_hex_attr, set_global_initializer_relocations_attr,
-    stored_type_union_name,
+    get_static_pointer_info, set_global_initializer_hex_attr,
+    set_global_initializer_relocations_attr, stored_type_union_name,
 };
 use super::statics::{
     GlobalInitializerData, GlobalInitializerRelocation, bytes_to_hex,
     encode_global_initializer_relocations, promoted_array_initializer,
 };
 use crate::error::{TranslationErr, TranslationResult};
+use crate::translator::facts;
 use crate::translator::types;
 use crate::translator::values::ValueMap;
 use dialect_mir::attributes::MirPointerKindAuthorityAttr;
@@ -33,7 +35,8 @@ use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron::{input_err, input_error_noloc};
 use rustc_public::mir;
-use rustc_public::ty::ConstantKind;
+use rustc_public::mir::alloc::GlobalAlloc;
+use rustc_public::ty::{ConstantKind, RigidTy, Ty, TyKind, UintTy};
 use std::num::NonZeroUsize;
 
 /// Translate a pointer-to-array constant to MIR operations.
@@ -88,6 +91,177 @@ pub(super) fn translate_ptr_to_array_constant(
         }
         _ => constant.const_.ty(),
     };
+    let global_alloc = emit_promoted_view_global(
+        ctx,
+        constant,
+        array_ty,
+        rust_array_ty,
+        "array",
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
+    let (ptr_val, last_op) = cast_to_declared_rust_pointer_type_if_needed(
+        ctx,
+        global_ptr,
+        const_ty_ptr,
+        block_ptr,
+        Some(global_alloc.get_operation()),
+        loc,
+        MirPointerKindAuthorityAttr::StaticAddress,
+    );
+    Ok((ptr_val, last_op))
+}
+
+/// Translate a `&[T]` / `&str` / `*const [T]` constant whose data word points
+/// into anonymous rustc memory, such as `const P: &[u8] = b"abc"`, a string
+/// literal, or a sub-slice computed in a `const`.
+///
+/// The constant is two words: a data pointer (one relocation into the backing
+/// allocation, plus a byte addend) and the `usize` length. The
+/// `len * size_of::<T>()` bytes it views become one immutable `[T; len]`
+/// device global, through the same gates and promoted-global path as a
+/// `&[T; N]` constant:
+///
+/// ```text
+///   const S: &[T] = { data: alloc+addend, len }
+///        │
+///        ▼
+///   @global : [T; len] = alloc bytes [addend .. addend + len * size_of T]
+///        │  generic *[T; len] ──► *T
+///        ▼
+///   construct_slice(*T, len)
+/// ```
+///
+/// The slice can outlive the function that names it (a helper may return
+/// it), so the data must not live in a stack slot. Slices whose data word
+/// points at a Rust `static` are lowered by the static branch of
+/// `translate_operand` and keep that static's identity; one that reaches this
+/// function fails closed rather than being copied. `str` views its bytes as
+/// `u8`; any other unsized pointee fails closed.
+pub(super) fn translate_slice_constant(
+    ctx: &mut Context,
+    constant: &mir::ConstOperand,
+    rust_ty: &Ty,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    use dialect_mir::types::MirArrayType;
+
+    let Some((pointee_ty, origin)) = get_static_pointer_info(rust_ty) else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "slice constant has Rust type {rust_ty:?}; expected a reference or raw pointer to a slice or str"
+            ))
+        );
+    };
+    let elem_rust_ty = match pointee_ty.kind() {
+        TyKind::RigidTy(RigidTy::Slice(elem)) => elem,
+        TyKind::RigidTy(RigidTy::Str) => Ty::unsigned_ty(UintTy::U8),
+        _ => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "fat-pointer constant of type {rust_ty:?} is not a slice or str; other unsized constants are not supported"
+                ))
+            );
+        }
+    };
+
+    // Only anonymous memory is copied into a promoted global. A data word
+    // into a static must keep pointing at that static, and a dangling or
+    // integer data word has no bytes to copy.
+    let Some(alloc) = constant_allocation(constant) else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "slice constant of type {rust_ty:?} is not backed by an evaluated allocation"
+            ))
+        );
+    };
+    let anonymous_data_word = matches!(
+        alloc.provenance.ptrs.as_slice(),
+        [(0, provenance)] if matches!(GlobalAlloc::from(provenance.0), GlobalAlloc::Memory(_))
+    );
+    if !anonymous_data_word {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "slice constant of type {rust_ty:?} must have exactly one data-word relocation, into anonymous constant memory; slices over statics take the static lowering"
+            ))
+        );
+    }
+
+    let len = slice_len_from_constant(constant, loc.clone())?;
+    let rust_array_ty = Ty::try_new_array(elem_rust_ty, len).map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "slice constant view [{elem_rust_ty:?}; {len}] has no array type: {e:?}"
+        )))
+    })?;
+    let elem_ty = types::translate_type(ctx, &elem_rust_ty)?;
+    let array_ty: TypeHandle = MirArrayType::get(ctx, elem_ty, len).into();
+    let global_alloc = emit_promoted_view_global(
+        ctx,
+        constant,
+        array_ty,
+        rust_array_ty,
+        "slice",
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    // global *[T; len] ──► generic *[T; len] ──► *T, then pair with the length.
+    let array_ptr_ty: TypeHandle = facts::mint_generic_ptr_type(ctx, array_ty, origin).into();
+    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
+    let (array_ptr, last_op) = cast_to_declared_rust_pointer_type_if_needed(
+        ctx,
+        global_ptr,
+        array_ptr_ty,
+        block_ptr,
+        Some(global_alloc.get_operation()),
+        loc.clone(),
+        MirPointerKindAuthorityAttr::StaticAddress,
+    );
+    let (data_ptr, last_op) = coerce_slice_data_pointee(
+        ctx,
+        array_ptr,
+        elem_ty,
+        origin.is_mutable(),
+        block_ptr,
+        last_op,
+        loc.clone(),
+    );
+
+    Ok(construct_slice_with_len(
+        ctx, data_ptr, elem_ty, len, origin, block_ptr, last_op, loc,
+    ))
+}
+
+/// Emit the immutable device global behind a pointer-to-array or slice
+/// constant, without the pointer cast that each caller adds.
+///
+/// `array_ty` is the converted `[T; N]` the global stores and
+/// `rust_array_ty` the Rust array type it mirrors; the initializer is the
+/// `N * size_of::<T>()` bytes the constant's data word points at. The gates
+/// are shared by both callers: no union storage, recursively promotable
+/// elements, and a converted storage size equal to rustc's layout size.
+/// `kind_name` ("array" or "slice") names the constant form in diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn emit_promoted_view_global(
+    ctx: &mut Context,
+    constant: &mir::ConstOperand,
+    array_ty: TypeHandle,
+    rust_array_ty: Ty,
+    kind_name: &str,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<MirGlobalAllocOp> {
     let expected_size = rust_type_layout_size(rust_array_ty, loc.clone())?;
     if expected_size != 0
         && let Some(union_name) = stored_type_union_name(rust_array_ty, &mut Vec::new())
@@ -95,7 +269,7 @@ pub(super) fn translate_ptr_to_array_constant(
         return input_err!(
             loc,
             TranslationErr::unsupported(format!(
-                "promoted array initializer contains union `{union_name}`; initialized union storage is not yet supported"
+                "promoted {kind_name} initializer contains union `{union_name}`; initialized union storage is not yet supported"
             ))
         );
     }
@@ -114,11 +288,11 @@ pub(super) fn translate_ptr_to_array_constant(
         return input_err!(
             loc,
             TranslationErr::unsupported(format!(
-                "translate_ptr_to_array_constant: converted array storage size {stored_size:?} disagrees with rustc layout size {expected_size}"
+                "promoted {kind_name} constant: converted array storage size {stored_size:?} disagrees with rustc layout size {expected_size}"
             ))
         );
     }
-    let initializer = promoted_array_initializer(constant, expected_size, "array", loc.clone())?;
+    let initializer = promoted_array_initializer(constant, expected_size, kind_name, loc.clone())?;
     let promoted_anchor = materialize_promoted_initializer_targets(
         ctx,
         &initializer.relocations,
@@ -127,26 +301,14 @@ pub(super) fn translate_ptr_to_array_constant(
         loc.clone(),
     )?;
 
-    let global_alloc = emit_promoted_immutable_global(
+    Ok(emit_promoted_immutable_global(
         ctx,
         array_ty,
         &initializer,
         block_ptr,
         promoted_anchor,
-        loc.clone(),
-    );
-
-    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
-    let (ptr_val, last_op) = cast_to_declared_rust_pointer_type_if_needed(
-        ctx,
-        global_ptr,
-        const_ty_ptr,
-        block_ptr,
-        Some(global_alloc.get_operation()),
         loc,
-        MirPointerKindAuthorityAttr::StaticAddress,
-    );
-    Ok((ptr_val, last_op))
+    ))
 }
 
 /// Materialize an evaluated constant allocation as an immutable device global.

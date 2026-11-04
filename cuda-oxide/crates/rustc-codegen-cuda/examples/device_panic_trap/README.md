@@ -7,9 +7,11 @@ There is no panic runtime and no `core::fmt` machinery on the GPU, so the
 diverging call into `core::panicking` is dropped and replaced by `nvvm.trap`
 (`trap;` in PTX) followed by `unreachable`. A thread that reaches it aborts the
 kernel; the message is discarded. The statements that would have built the
-message are dead once the call is gone, so they are never translated — which is
-what makes the kernel compilable, since a materialized `&str` constant has no
-device lowering.
+message are dead once the call is gone, so they are never translated. A plain
+`&str` message would translate, but a message with format arguments
+(`panic!("{}", x)`) builds `core::fmt` argument values that have no device
+lowering yet, so skipping these statements is what keeps such a kernel
+compilable.
 
 ## Trigger
 

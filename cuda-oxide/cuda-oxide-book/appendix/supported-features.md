@@ -74,6 +74,16 @@ deduplicate to the same immutable initializer. Overlapping or otherwise
 non-representable struct layouts remain outside immutable promotion and keep
 the existing fail-closed behavior.
 
+Slice and string constants whose data lives in memory rustc allocated for the
+constant itself (`const P: &[u8] = b"abc"`, `&str` literals, `&[..]` consts,
+and sub-slices computed in a `const`) use the same promoted immutable global.
+The global holds only the `len * size_of::<T>()` bytes the slice views, starting
+at the data word's byte addend, and the slice is rebuilt from the global's
+address and the constant's length word. Because the data is a global, a helper
+can return such a slice. Element types follow the pointer-to-array rules above;
+slices over device statics keep pointing at the static instead of a copy.
+`dyn` metadata and other unsized pointees remain rejected.
+
 Thin pointer fields in array, tuple, and struct **const** values that do not take
 the immutable-table promotion path are materialized via `MirGlobalAllocOp` per
 field, including non-zero byte addends into a static (see
