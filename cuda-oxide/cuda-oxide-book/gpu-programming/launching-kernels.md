@@ -100,6 +100,12 @@ fn main() {
 | `module.vecadd(...)`   | Type-checks arguments; raw config requires `unsafe` |
 | `LaunchConfig`         | Grid/block dimensions and smem      |
 
+`#[cuda_module]` only sees kernels written out in the module's source. Kernels
+behind `mod child;`, `include!`, or a `macro_rules!` invocation inside the
+module are not discovered, because an attribute macro runs before those are
+expanded. To stamp out kernel variants with a declarative macro, let the macro
+emit the whole `#[cuda_module] mod kernels { ... }` instead.
+
 ### Argument mapping
 
 The generated method maps kernel parameters to host values:

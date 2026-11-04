@@ -1,0 +1,11 @@
+error: cuda_module found no #[kernel] functions in this module; macro invocations inside a #[cuda_module] are not expanded before it runs, so kernels they generate are not discovered. Have the macro generate the whole `#[cuda_module] mod` instead
+  --> tests/compile_fail/cuda_module_macro_rules_kernel.rs:12:5
+   |
+12 | mod kernels {
+   |     ^^^^^^^
+
+error: this macro invocation is not expanded before #[cuda_module] runs
+  --> tests/compile_fail/cuda_module_macro_rules_kernel.rs:22:5
+   |
+22 |     fill_kernel!(fill);
+   |     ^^^^^^^^^^^^^^^^^^

@@ -1493,3 +1493,74 @@ fn non_generic_kernel_lookups_never_consult_the_divergence_diagnosis() {
         "non-generic lookups must keep the ordinary error path: {expanded}"
     );
 }
+
+#[test]
+fn macro_invocation_without_kernels_explains_the_expansion_boundary() {
+    // Attribute macros see `fill_kernel!(fill)` before it expands, so the
+    // kernel it generates is invisible. The error must say so instead of
+    // only reporting an empty module.
+    let module: ItemMod = parse_quote! {
+        mod kernels {
+            macro_rules! fill_kernel {
+                ($name:ident) => {
+                    #[kernel]
+                    pub fn $name(value: u32) {}
+                };
+            }
+
+            fill_kernel!(fill);
+        }
+    };
+    let error = expand_cuda_module(module).expect_err("macro-only module must fail");
+    let messages: Vec<String> = error.into_iter().map(|e| e.to_string()).collect();
+    assert!(
+        messages[0].contains("macro invocations inside a #[cuda_module] are not expanded"),
+        "unexpected error messages: {messages:?}"
+    );
+    assert!(
+        messages[0].contains("generate the whole `#[cuda_module] mod`"),
+        "unexpected error messages: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("this macro invocation is not expanded")),
+        "missing invocation note: {messages:?}"
+    );
+}
+
+#[test]
+fn macro_invocation_in_nested_inline_module_is_reported() {
+    let module: ItemMod = parse_quote! {
+        mod kernels {
+            mod child {
+                kernels_from_elsewhere!();
+            }
+        }
+    };
+    let error = expand_cuda_module(module).expect_err("macro-only module must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("macro invocations inside a #[cuda_module] are not expanded"),
+        "unexpected error message: {error}"
+    );
+}
+
+#[test]
+fn macro_rules_definition_alone_keeps_the_empty_module_error() {
+    // A definition is not an invocation: nothing was hidden from the macro,
+    // so the plain empty-module diagnostic still applies.
+    let module: ItemMod = parse_quote! {
+        mod kernels {
+            macro_rules! unused {
+                () => {};
+            }
+        }
+    };
+    let error = expand_cuda_module(module).expect_err("empty module must fail");
+    assert_eq!(
+        error.to_string(),
+        "cuda_module found no #[kernel] functions in this module"
+    );
+}

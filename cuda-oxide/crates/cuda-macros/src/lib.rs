@@ -237,9 +237,30 @@ pub fn ptx_asm(input: TokenStream) -> TokenStream {
 /// The generated method name `as_cuda_module` is reserved in every kernel
 /// namespace, and `from_parent` is additionally reserved in nested namespaces.
 ///
-/// Procedural macros cannot see the contents of `mod child;` or `include!`.
+/// Procedural macros cannot see the contents of `mod child;` or of macro
+/// invocations such as `include!` or a local `macro_rules!` call: an
+/// attribute macro runs before the invocations inside its input are expanded.
 /// Those items are preserved, but kernels behind either boundary do not get
 /// generated launchers. Keep auto-launched nested kernels in inline modules.
+/// To generate kernels with a declarative macro, have the macro emit the
+/// whole module, so `#[cuda_module]` sees the expanded kernels:
+///
+/// ```ignore
+/// macro_rules! fill_module {
+///     ($($name:ident: $ty:ty),*) => {
+///         #[cuda_module]
+///         mod kernels {
+///             use super::*;
+///             $(
+///                 #[kernel]
+///                 pub fn $name(mut out: DisjointSlice<$ty>, value: $ty) { /* ... */ }
+///             )*
+///         }
+///     };
+/// }
+///
+/// fill_module!(fill_u32: u32, fill_f32: f32);
+/// ```
 ///
 /// Launcher methods are namespace-qualified, but PTX entry symbols are still
 /// bare function names. Kernel names must therefore be unique throughout one
